@@ -1,20 +1,43 @@
 'use strict';
-var Cl = window.Cl || {};
+window.Cl = window.Cl || {};
 
-Cl.filerTooltip = function ($) {
-    var tooltipSelector = '.js-filer-tooltip';
+Cl.filerTooltip = () => {
+    const tooltipSelector = '.js-filer-tooltip';
+    const tooltips = document.querySelectorAll(tooltipSelector);
 
-    $(tooltipSelector).on('mouseover', function () {
-        var that = $(this);
-        var title = that.attr('title');
+    const showTooltip = function () {
+        const title = this.getAttribute('title');
+        if (!title) {
+            return;
+        }
 
-        that.data('filerTooltip', title).removeAttr('title');
-        $('<p class="filer-tooltip"></p>').text(title).appendTo(tooltipSelector);
+        this.dataset.filerTooltip = title;
+        this.removeAttribute('title');
 
-    }).on('mouseout', function () {
-        var that = $(this);
+        const tooltip = document.createElement('p');
+        tooltip.className = 'filer-tooltip';
+        tooltip.textContent = title;
+        // the reason is exposed to assistive technology via aria-describedby on the control
+        tooltip.setAttribute('aria-hidden', 'true');
+        this.appendChild(tooltip);
+    };
 
-        that.attr('title', that.data('filerTooltip'));
-        $('.filer-tooltip').remove();
+    const hideTooltip = function () {
+        const title = this.dataset.filerTooltip;
+        if (title) {
+            this.setAttribute('title', title);
+        }
+
+        this.querySelectorAll('.filer-tooltip').forEach((t) => {
+            t.remove();
+        });
+    };
+
+    tooltips.forEach((element) => {
+        element.addEventListener('mouseover', showTooltip);
+        element.addEventListener('mouseout', hideTooltip);
+        // keyboard users get the same hint when the control receives focus
+        element.addEventListener('focusin', showTooltip);
+        element.addEventListener('focusout', hideTooltip);
     });
 };

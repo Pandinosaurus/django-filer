@@ -3,41 +3,22 @@
 {% spaceless %}
     <div class="filer-dropzone filer-dropzone-folder">
         <span class="filerFile">
-            <span id="{{ span_id }}" style="margin-left: 15px;">
-                {% trans "Folder" %}:
-                {% if object %}
-                    {{ object.pretty_logical_path }}
-                {% else %}
-                    {% trans "none selected" %}
-                {% endif %}
-            </span>
             <a href="{{ lookup_url }}" class="related-lookup{% if object %} hidden{% endif %}" id="{{ lookup_name }}" title="{% trans 'Lookup' %}">
-                {% trans "Add Folder" %}
+                <span class="fa fa-search cms-icon cms-icon-search" aria-hidden="true"></span>&nbsp;
+                {% trans "Choose Folder" %}
             </a>
-
-            <img id="{{ clear_id }}" src="{% static 'filer/img/icon_deletelink.gif' %}" width="10" height="10" alt="{% trans 'Clear' %}" title="{% trans 'Clear' %}" class="filerClearer{% if not object %} hidden{% endif %}">
-            {{ hidden_input }}
+            <img src="{% static "filer/icons/folder.svg" %}" alt="" class="thumbnail_img{% if not object %} hidden{% endif %}"/>
+            <span id="{{ span_id }}" style="margin-left: 15px;">
+                <span class="description_text">
+                    {% if object %}
+                        {{ object.pretty_logical_path }}
+                    {% endif %}
+                </span>
+            </span>
+            <a class="filerClearer {% if not object %}hidden{% endif %}" id="{{ clear_id }}" title="{% translate 'Clear' %}" aria-label="{% translate 'Clear' %}" href="#" role="button">
+                <span class="fa fa-close filer-icon filer-icon-remove-selection" aria-hidden="true"></span>
+            </a>
+            <div class="hidden">{{ hidden_input }}</div>
         </span>
     </div>
-    <script type="text/javascript">
-        'use strict';
-        /* globals django */
-
-        (function ($) {
-            var clearButton = $('#{{ clear_id }}');
-            var input = $('#{{ id }}');
-            var folderName = $('#{{ descid }}');
-            var addFolderButton = $('#{{ lookup_name }}');
-
-            clearButton.on('click', function () {
-                folderName.text('{% trans "Folder" %}: {% trans "none selected" %}');
-                input.removeAttr('value');
-
-                clearButton.addClass('hidden');
-                addFolderButton.removeClass('hidden');
-            });
-        }(django.jQuery));
-    </script>
 {% endspaceless %}
-
-<link rel="stylesheet" type="text/css" href="{% static 'filer/css/admin_filer.css' %}">

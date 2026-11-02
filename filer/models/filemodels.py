@@ -1,19 +1,20 @@
 import hashlib
 import mimetypes
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.db import models
+from django.db.models import Count
 from django.urls import NoReverseMatch, reverse
-from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 
 from polymorphic.managers import PolymorphicManager
 from polymorphic.models import PolymorphicModel
+from polymorphic.query import PolymorphicQuerySet
 
 from .. import settings as filer_settings
 from ..fields.multistorage_file import MultiStorageFileField
@@ -21,15 +22,34 @@ from . import mixins
 from .foldermodels import Folder
 
 
+class FileQuerySet(PolymorphicQuerySet):
+    def only(self, *fields):
+        fields = set(fields)
+        fields.update(["_file_size", "sha1", "is_public"])
+        return super().only(*fields)
+
+
 class FileManager(PolymorphicManager):
+    queryset_class = FileQuerySet
+
     def find_all_duplicates(self):
-        r = {}
-        for file_obj in self.all():
-            if file_obj.sha1:
-                q = self.filter(sha1=file_obj.sha1)
-                if len(q) > 1:
-                    r[file_obj.sha1] = q
-        return r
+        # Select duplicate groups in SQL, then return a stable snapshot.
+        digests = (
+            self.exclude(sha1='').order_by().values('sha1')
+            .annotate(total=Count('pk')).filter(total__gt=1)
+            .values_list('sha1', flat=True)
+        )
+        groups = {}
+        for file_obj in self.filter(sha1__in=digests).order_by('sha1', 'pk'):
+            groups.setdefault(file_obj.sha1, []).append(file_obj)
+        # Keep returning evaluated querysets, as callers may filter or delete them.
+        duplicates = {}
+        for sha1, files in groups.items():
+            queryset = self.filter(sha1=sha1).order_by('pk')
+            queryset._result_cache = files
+            queryset._prefetch_done = True
+            duplicates[sha1] = queryset
+        return duplicates
 
     def find_duplicates(self, file_obj):
         return [i for i in self.exclude(pk=file_obj.pk).filter(sha1=file_obj.sha1)]
@@ -49,27 +69,63 @@ def mimetype_validator(value):
 
 class File(PolymorphicModel, mixins.IconsMixin):
     file_type = 'File'
-    _icon = "file"
+    _icon = 'file'
     _file_data_changed_hint = None
 
     folder = models.ForeignKey(
         Folder,
-        verbose_name=_('folder'),
+        verbose_name=_("folder"),
         related_name='all_files',
         null=True,
         blank=True,
         on_delete=models.CASCADE,
     )
-    file = MultiStorageFileField(_('file'), null=True, blank=True, max_length=255)
-    _file_size = models.BigIntegerField(_('file size'), null=True, blank=True)
 
-    sha1 = models.CharField(_('sha1'), max_length=40, blank=True, default='')
+    file = MultiStorageFileField(
+        _("file"),
+        null=True,
+        blank=True,
+        max_length=255,
+    )
 
-    has_all_mandatory_data = models.BooleanField(_('has all mandatory data'), default=False, editable=False)
+    _file_size = models.BigIntegerField(
+        _("file size"),
+        null=True,
+        blank=True,
+    )
 
-    original_filename = models.CharField(_('original filename'), max_length=255, blank=True, null=True)
-    name = models.CharField(max_length=255, default="", blank=True, verbose_name=_('name'))
-    description = models.TextField(null=True, blank=True, verbose_name=_('description'))
+    sha1 = models.CharField(
+        _("sha1"),
+        max_length=40,
+        blank=True,
+        default='',
+    )
+
+    has_all_mandatory_data = models.BooleanField(
+        _("has all mandatory data"),
+        default=False,
+        editable=False,
+    )
+
+    original_filename = models.CharField(
+        _("original filename"),
+        max_length=255,
+        blank=True,
+        null=True,
+    )
+
+    name = models.CharField(
+        max_length=255,
+        default="",
+        blank=True,
+        verbose_name=_("name"),
+    )
+
+    description = models.TextField(
+        null=True,
+        blank=True,
+        verbose_name=_("description"),
+    )
 
     owner = models.ForeignKey(
         getattr(settings, 'AUTH_USER_MODEL', 'auth.User'),
@@ -77,27 +133,47 @@ class File(PolymorphicModel, mixins.IconsMixin):
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        verbose_name=_('owner'),
+        verbose_name=_("owner"),
     )
 
-    uploaded_at = models.DateTimeField(_('uploaded at'), auto_now_add=True)
-    modified_at = models.DateTimeField(_('modified at'), auto_now=True)
+    uploaded_at = models.DateTimeField(
+        _("uploaded at"),
+        auto_now_add=True,
+    )
+
+    modified_at = models.DateTimeField(
+        _("modified at"),
+        auto_now=True,
+    )
 
     is_public = models.BooleanField(
         default=is_public_default,
-        verbose_name=_('Permissions disabled'),
-        help_text=_('Disable any permission checking for this '
-                    'file. File will be publicly accessible '
-                    'to anyone.'))
+        verbose_name=_("Permissions disabled"),
+        help_text=_("Disable any permission checking for this "
+                    "file. File will be publicly accessible "
+                    "to anyone."))
 
     mime_type = models.CharField(
         max_length=255,
-        help_text='MIME type of uploaded content',
+        help_text="MIME type of uploaded content",
         validators=[mimetype_validator],
         default='application/octet-stream',
     )
 
     objects = FileManager()
+
+    class Meta:
+        app_label = 'filer'
+        verbose_name = _("file")
+        verbose_name_plural = _("files")
+        base_manager_name = 'objects'
+
+    def __str__(self):
+        if self.name in ('', None):
+            text = f"{self.original_filename}"
+        else:
+            text = f"{self.name}"
+        return text
 
     @classmethod
     def matches_file_type(cls, iname, ifile, mime_type):
@@ -110,11 +186,13 @@ class File(PolymorphicModel, mixins.IconsMixin):
 
     @cached_property
     def mime_maintype(self):
-        return self.mime_type.split('/')[0]
+        # partition() instead of split(): a malformed MIME type without a slash
+        # must not raise. "or ''" guards against legacy rows holding NULL.
+        return (self.mime_type or '').partition('/')[0]
 
     @cached_property
     def mime_subtype(self):
-        return self.mime_type.split('/')[1]
+        return (self.mime_type or '').partition('/')[2]
 
     def file_data_changed(self, post_init=False):
         """
@@ -142,6 +220,12 @@ class File(PolymorphicModel, mixins.IconsMixin):
             self.generate_sha1()
         except Exception:
             self.sha1 = ''
+        try:
+            self.mime_type = mimetypes.guess_type(self.file.name)[0] or 'application/octet-stream'
+        except Exception:
+            # Cannot find new mime-type? Keep existing
+            pass
+
         return True
 
     def _move_file(self):
@@ -165,14 +249,15 @@ class File(PolymorphicModel, mixins.IconsMixin):
         self.is_public = not self.is_public
         self.file.delete_thumbnails()
         self.is_public = not self.is_public
+        src_file = src_storage.open(src_file_name)
         # This is needed because most of the remote File Storage backend do not
         # open the file.
-        src_file = src_storage.open(src_file_name)
-        src_file.open()
+        # Context manager closes file after reading contents
+        with src_file.open() as f:
+            content_file = ContentFile(f.read())
         # hint file_data_changed callback that data is actually unchanged
         self._file_data_changed_hint = False
-        self.file = dst_storage.save(dst_file_name,
-            ContentFile(src_file.read()))
+        self.file = dst_storage.save(dst_file_name, content_file)
         src_storage.delete(src_file_name)
 
     def _copy_file(self, destination, overwrite=False):
@@ -189,10 +274,14 @@ class File(PolymorphicModel, mixins.IconsMixin):
         src_file_name = self.file.name
         storage = self.file.storages['public' if self.is_public else 'private']
 
-        # This is needed because most of the remote File Storage backend do not
-        # open the file.
         src_file = storage.open(src_file_name)
-        src_file.open()
+        try:
+            # This is needed because most of the remote File Storage backend do not
+            # open the file. Re-opening would create a value error.
+            src_file.open()
+        except ValueError:  # pragma: no cover
+            # If a validation error is raised, the file is already open.
+            pass
         return storage.save(destination, ContentFile(src_file.read()))
 
     def generate_sha1(self):
@@ -237,20 +326,20 @@ class File(PolymorphicModel, mixins.IconsMixin):
             text = self.original_filename or 'unnamed file'
         else:
             text = self.name
-        text = "%s" % (text,)
+        text = f"{text}"
         return text
 
     def __lt__(self, other):
         return self.label.lower() < other.label.lower()
 
     def has_edit_permission(self, request):
-        return self.has_generic_permission(request, 'edit')
+        return request.user.has_perm("filer.change_file") and self.has_generic_permission(request, 'edit')
 
     def has_read_permission(self, request):
         return self.has_generic_permission(request, 'read')
 
     def has_add_children_permission(self, request):
-        return self.has_generic_permission(request, 'add_children')
+        return request.user.has_perm("filer.add_file") and self.has_generic_permission(request, 'add_children')
 
     def has_generic_permission(self, request, permission_type):
         """
@@ -262,39 +351,32 @@ class File(PolymorphicModel, mixins.IconsMixin):
             return False
         elif user.is_superuser:
             return True
-        elif user == self.owner:
+        # Compare keys to avoid loading the owner row; a missing owner never matches.
+        elif self.owner_id is not None and self.owner_id == user.pk:
             return True
         elif self.folder:
             return self.folder.has_generic_permission(request, permission_type)
         else:
             return False
 
-    def __str__(self):
-        if self.name in ('', None):
-            text = "%s" % (self.original_filename,)
-        else:
-            text = "%s" % (self.name,)
-        return text
-
-    def get_admin_change_url(self):
+    def get_admin_url(self, action):
         return reverse(
-            'admin:{0}_{1}_change'.format(
+            'admin:{}_{}_{}'.format(
                 self._meta.app_label,
                 self._meta.model_name,
+                action
             ),
             args=(self.pk,)
         )
 
+    def get_admin_change_url(self):
+        return self.get_admin_url("change")
+
+    def get_admin_expand_view_url(self):
+        return self.get_admin_url("expand")
+
     def get_admin_delete_url(self):
-        try:
-            # Django <=1.6
-            model_name = self._meta.module_name
-        except AttributeError:
-            # Django >1.6
-            model_name = self._meta.model_name
-        return reverse(
-            'admin:{0}_{1}_delete'.format(self._meta.app_label, model_name,),
-            args=(self.pk,))
+        return self.get_admin_url("delete")
 
     @property
     def url(self):
@@ -365,15 +447,10 @@ class File(PolymorphicModel, mixins.IconsMixin):
         """
         folder_path = []
         if self.folder:
-            folder_path.extend(self.folder.get_ancestors())
+            folder_path.extend(self.folder.logical_path)
         folder_path.append(self.logical_folder)
         return folder_path
 
     @property
     def duplicates(self):
         return File.objects.find_duplicates(self)
-
-    class Meta:
-        app_label = 'filer'
-        verbose_name = _('file')
-        verbose_name_plural = _('files')

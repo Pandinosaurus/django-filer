@@ -48,8 +48,20 @@ class UnsortedImages(DummyFolder):
     is_unsorted_uploads = True
     _icon = "unfiled_folder"
 
+    def __init__(self, user=None):
+        super().__init__()
+        self.user = user
+
     def _files(self):
-        return File.objects.filter(folder__isnull=True)
+        """
+        If the current user is not a superuser, we don't them to see/edit/change
+        file in the unsorted uploads folder that they don't own.
+        """
+        if self.user.is_superuser or not filer_settings.FILER_ENABLE_PERMISSIONS:
+            return File.objects.filter(folder__isnull=True)
+        else:
+            return File.objects.filter(folder__isnull=True, owner=self.user)
+
     files = property(_files)
 
     def get_admin_directory_listing_url_path(self):
@@ -89,11 +101,9 @@ class FolderRoot(DummyFolder):
     parent_url = None
 
     def contains_folder(self, folder_name):
-        try:
-            self.children.get(name=folder_name)
-            return True
-        except Folder.DoesNotExist:
-            return False
+        # Do not use self.children: with FILER_ENABLE_PERMISSIONS it lists
+        # all folders, not only the root folders.
+        return Folder.objects.filter(parent__isnull=True, name=folder_name).exists()
 
     def get_admin_directory_listing_url_path(self):
         return reverse('admin:filer-directory_listing-root')

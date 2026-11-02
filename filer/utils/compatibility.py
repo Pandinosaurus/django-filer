@@ -12,19 +12,19 @@ def truncate_words(s, num, end_text='...'):
     return Truncator(s).words(num, truncate=truncate)
 
 
-truncate_words = keep_lazy(truncate_words, str)
+truncate_words = keep_lazy(str)(truncate_words)
 
 
 def get_delete_permission(opts):
-    from django.contrib.auth import get_permission_codename  # noqa
-    return '%s.%s' % (opts.app_label, get_permission_codename('delete', opts))
+    from django.contrib.auth import get_permission_codename
+    return '{}.{}'.format(opts.app_label, get_permission_codename('delete', opts))
 
 
 try:
-    from PIL import ExifTags as PILExifTags  # noqa
-    from PIL import Image as PILImage  # noqa
-    from PIL import ImageDraw as PILImageDraw  # noqa
-except ImportError:
+    from PIL import ExifTags as PILExifTags
+    from PIL import Image as PILImage
+    from PIL import ImageDraw as PILImageDraw
+except ImportError:  # pragma: no cover
     try:
         import ExifTags as PILExifTags  # noqa
         import Image as PILImage  # noqa

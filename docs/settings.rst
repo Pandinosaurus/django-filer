@@ -6,7 +6,7 @@ Settings
 ``FILER_ENABLE_PERMISSIONS``
 ----------------------------
 
-Activate the or not the Permission check on the files and folders before 
+Activate the or not the Permission check on the files and folders before
 displaying them in the admin. When set to ``False`` it gives all the authorization
 to staff members based on standard Django model permissions.
 
@@ -69,11 +69,13 @@ e.g::
 
 Defaults to FileSystemStorage in ``<MEDIA_ROOT>/filer_public/`` and ``<MEDIA_ROOT>/filer_public_thumbnails/`` for public files and
 ``<MEDIA_ROOT>/../smedia/filer_private/`` and ``<MEDIA_ROOT>/../smedia/filer_private_thumbnails/`` for private files.
-Public storage uses ``DEFAULT_FILE_STORAGE`` as default storage backend.
+Public storage uses the default storage's backend. This is taken from Django's ``STORAGES``
+setting if it exists or, if not, from the ``DEFAULT_FILE_STORAGE`` setting for compatibility
+with earlier Django versions (5.0 or below).
 
 ``UPLOAD_TO`` is the function to generate the path relative to the storage root. The
 default generates a random path like ``1d/a5/1da50fee-5003-46a1-a191-b547125053a8/filename.jpg``. This
-will be applied whenever a file is uploaded or moved between public (without permission checks) and 
+will be applied whenever a file is uploaded or moved between public (without permission checks) and
 private (with permission checks) storages. Defaults to ``'filer.utils.generate_filename.randomized'``.
 
 Overriding single keys is possible, for example just set your custom ``UPLOAD_TO``::
@@ -117,12 +119,12 @@ Defaults to using the DefaultServer (doh)! This will serve the files with the dj
 The number of items (Folders, Files) that should be displayed per page in
 admin.
 
-Defaults to ``20``
+Defaults to ``100``
 
 ``FILER_SUBJECT_LOCATION_IMAGE_DEBUG``
 --------------------------------------
 
-Draws a red circle around to point in the image that was used to do the 
+Draws a red circle around to point in the image that was used to do the
 subject location aware image cropping.
 
 Defaults to ``False``
@@ -153,6 +155,15 @@ Defines the path element common to all canonical file URLs.
 Defaults to ``'canonical/'``
 
 
+``FILER_UPLOADER_MAX_FILES``
+----------------------------
+
+Limit of files to upload by one drag and drop event. This is to avoid
+extensive accidental uploads, e.g. by dragging to root direcory onto an
+upload field.
+
+Defaults to ``100``.
+
 ``FILER_UPLOADER_CONNECTIONS``
 ------------------------------
 
@@ -161,3 +172,46 @@ Number of simultaneous AJAX uploads. Defaults to 3.
 If your database backend is SQLite it would be set to 1 by default. This allows
 to avoid ``database is locked`` errors on SQLite during multiple simultaneous
 file uploads.
+
+``FILER_UPLOADER_MAX_FILE_SIZE``
+--------------------------------
+
+Limits the maximal file size if set. Takes an integer (file size in MB).
+
+Defaults to ``None``.
+
+``FILER_MAX_IMAGE_PIXELS``
+--------------------------------
+
+Limits the maximal pixel size of the image that can be uploaded to the Filer.
+It will also be lower than or equals to the MAX_IMAGE_PIXELS that Pillow's PIL allows.
+
+
+``MAX_IMAGE_PIXELS = int(1024 * 1024 * 1024 // 4 // 3)``
+
+Defaults to ``MAX_IMAGE_PIXELS``. But when set, should always be lower than the MAX_IMAGE_PIXELS limit set by Pillow.
+
+This is useful setting to prevent decompression bomb DOS attack.
+
+The limit applies to every image whose pixel size is known, a vector image (SVG)
+included: an SVG is measured by the size it declares, and is refused just like a
+raster image if that exceeds the limit.
+
+Images whose size cannot be read are treated differently by type. For a raster
+image that is itself the signature of a decompression bomb, because Pillow
+reports no size for one, so it is refused. A vector image has no pixel count to
+compare against, so it is stored with unset dimensions and rendered with a
+generic icon in the admin.
+
+
+``FILER_ADD_FILE_VALIDATORS``
+-----------------------------
+
+Dictionary that adds file upload validators for specific mime types.
+See :ref:`validation`.
+
+``FILER_REMOVE_FILE_VALIDATORS``
+--------------------------------
+
+List of default file validators to be ignored.
+See :ref:`validation`.

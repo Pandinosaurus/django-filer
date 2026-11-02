@@ -7,6 +7,99 @@ Usually upgrade procedure is straightforward: update the package and run migrati
 require special attention from the developer and here we provide upgrade instructions for such cases.
 
 
+Root folder name uniqueness
+---------------------------
+
+Migration ``0019_unique_root_folder_name`` prevents duplicate root folder names
+on databases supporting partial unique indexes (including PostgreSQL and SQLite).
+If duplicate roots already exist, the migration stops and asks you to rename
+conflicting folders before retrying. It does not rename or merge user data.
+If a concurrent write creates duplicates after the initial check, constraint
+creation stops with the same instructions. Pause folder writes while resolving
+the conflicts and retrying the migration to avoid repeated failures.
+You can find conflicts in the Django shell with:
+
+.. code-block:: python
+
+    from django.db.models import Count
+    from filer.models import Folder
+
+    Folder.objects.filter(parent__isnull=True).order_by().values("name").annotate(
+        total=Count("pk")
+    ).filter(total__gt=1)
+
+MySQL and MariaDB do not support partial unique indexes. Django reports
+``models.W036`` and skips this constraint on those backends; concurrent root
+creation remains unprotected there. The existing uniqueness constraint on
+non-root siblings continues to apply on all supported backends.
+
+
+from 3.x to 3.6
+---------------
+
+django-filer 3.6 no longer installs an SVG renderer. It reads an SVG's size from
+the document and thumbnails it by rewriting the root element, so svglib and
+reportlab (roughly 14 MB, pulled in through ``easy-thumbnails[svg]``) became the
+optional :ref:`optional_svg_support` extra.
+
+Upgrading an existing environment changes nothing: ``pip install -U django-filer``
+does not uninstall packages that are already there. Fresh installs and re-locked
+dependency files (``uv.lock``, ``poetry.lock``, ``pip-compile`` output) do drop
+them, and that is where you may notice a difference.
+
+Only documents whose size cannot be read from the markup still need the renderer,
+for example ``width="100%"`` without a ``viewBox``. Their dimensions stay unset
+and the admin shows a generic image icon instead of a preview. If your project has
+such files, install
+
+.. code-block:: shell
+
+    $ pip install django-filer\[svg\]
+
+SVG thumbnails generated from 3.6 on are the original document rescaled rather
+than a reportlab rendering of it, which preserves the vector data more faithfully.
+Thumbnail file names are unchanged, so thumbnails cached by earlier versions keep
+being served.
+
+
+from 3.x to 3.3
+---------------
+
+django-filer version 3.3 contains a change in security policy for file uploads.
+**By default, binary file or files of unknown type are not allowed to be uploaded.**
+To allow upload of binary files in your project, add
+
+.. code-block:: python
+
+    FILER_REMOVE_FILE_VALIDATORS = [
+        "application/octet-stream",
+    ]
+
+to your project's settings. Be aware that binary files always are a security risk.
+See :ref:`check_virus` for more information on how to configure file upload validators,
+e.g., running files through a virus checker.
+
+
+
+from 2.x to 3.0
+---------------
+
+The dependency on django-mptt is dropped as of django-filer 3.0.
+
+This implies that three fields are removed from the ``Folder`` model:
+
+* ``level``
+* ``lft``
+* ``rght``
+* ``tree_id``
+
+Those fields were used by django-mptt for performance optimization and are
+not required any more.
+
+Also, upload restrictions exist for HTML and SVG files by default. Please
+check :ref:`validation` for more details.
+
+
 from 0.9.1 to 0.9.2
 -------------------
 

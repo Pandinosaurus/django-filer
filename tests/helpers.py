@@ -25,7 +25,7 @@ def create_folder_structure(depth=2, sibling=2, parent=None):
         depth_range.reverse()
         for d in depth_range:
             for s in range(1, sibling + 1):
-                name = "folder: %s -- %s" % (str(d), str(s))
+                name = "folder: {} -- {}".format(str(d), str(s))
                 folder = Folder(name=name, parent=parent)
                 folder.save()
                 create_folder_structure(depth=d - 1, sibling=sibling, parent=folder)
@@ -48,7 +48,7 @@ def create_image(mode='RGB', size=(800, 600)):
 
 class SettingsOverride:
     """
-    Overrides Django settings within a context and resets them to their inital
+    Overrides Django settings within a context and resets them to their initial
     values on exit.
 
     Example:

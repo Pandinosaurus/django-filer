@@ -1,12 +1,18 @@
 import logging
 
+from django.conf import settings
+from django.core.checks import Warning
+from django.core.checks import register as register_check
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 
-from easy_thumbnails.VIL import Image as VILImage
+import easy_thumbnails.utils
+from PIL.Image import MAX_IMAGE_PIXELS
 
 from .. import settings as filer_settings
+from ..utils import svg
 from ..utils.compatibility import PILImage
 from ..utils.filer_easy_thumbnails import FilerThumbnailer
 from ..utils.pil_exif import get_exif_for_file
@@ -14,6 +20,30 @@ from .filemodels import File
 
 
 logger = logging.getLogger(__name__)
+
+
+# We can never exceed the max pixel value set by Pillow's PIL Image MAX_IMAGE_PIXELS
+# as if we allow it, it will fail while thumbnailing (first in the admin thumbnails
+# and then in the page itself.
+# Refer this https://github.com/python-pillow/Pillow/blob/b723e9e62e4706a85f7e44cb42b3d838dae5e546/src/PIL/Image.py#L3148
+FILER_MAX_IMAGE_PIXELS = getattr(settings, "FILER_MAX_IMAGE_PIXELS", MAX_IMAGE_PIXELS)
+if MAX_IMAGE_PIXELS is not None:
+    FILER_MAX_IMAGE_PIXELS = min(FILER_MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
+
+
+@register_check()
+def max_pixel_setting_check(app_configs, **kwargs):
+    if not FILER_MAX_IMAGE_PIXELS:
+        return [
+            Warning(
+                "Both settings.FILER_MAX_IMAGE_PIXELS and PIL.Image.MAX_IMAGE_PIXELS are not set.",
+                hint="Set FILER_MAX_IMAGE_PIXELS to a positive integer value in your settings.py. "
+                     "This setting is used to limit the maximum number of pixels an image can have "
+                     "to protect your site from memory bombs.",
+                obj=settings,
+            )
+        ]
+    return []
 
 
 class BaseImage(File):
@@ -29,30 +59,69 @@ class BaseImage(File):
     file_type = 'Image'
     _icon = "image"
 
-    _height = models.FloatField(null=True, blank=True)
-    _width = models.FloatField(null=True, blank=True)
+    _height = models.FloatField(
+        null=True,
+        blank=True,
+    )
 
-    default_alt_text = models.CharField(_('default alt text'), max_length=255, blank=True, null=True)
-    default_caption = models.CharField(_('default caption'), max_length=255, blank=True, null=True)
+    _width = models.FloatField(
+        null=True,
+        blank=True,
+    )
 
-    subject_location = models.CharField(_('subject location'), max_length=64, blank=True,
-                                        default='')
+    _transparent = models.BooleanField(
+        null=False,
+        default=False,
+    )
+
+    default_alt_text = models.CharField(
+        _("default alt text"),
+        max_length=255,
+        blank=True,
+        null=True,
+    )
+
+    default_caption = models.CharField(
+        _("default caption"),
+        max_length=255,
+        blank=True,
+        null=True,
+    )
+
+    subject_location = models.CharField(
+        _("subject location"),
+        max_length=64,
+        blank=True,
+        default='',
+    )
+
     file_ptr = models.OneToOneField(
-        to='filer.File', parent_link=True,
+        to='filer.File',
+        parent_link=True,
         related_name='%(app_label)s_%(class)s_file',
         on_delete=models.CASCADE,
     )
 
+    class Meta:
+        app_label = 'filer'
+        verbose_name = _("image")
+        verbose_name_plural = _("images")
+        abstract = True
+        default_manager_name = 'objects'
+
     @classmethod
     def matches_file_type(cls, iname, ifile, mime_type):
         # source: https://www.freeformatter.com/mime-types-list.html
-        image_subtypes = ['gif', 'jpeg', 'png', 'x-png', 'svg+xml']
-        maintype, subtype = mime_type.split('/')
-        return maintype == 'image' and subtype in image_subtypes
+        from ..settings import IMAGE_MIME_TYPES
+        # partition() instead of split(): a malformed MIME type without a slash
+        # must not raise. "or ''" guards against a missing MIME type.
+        maintype, _, subtype = (mime_type or '').partition('/')
+        return maintype == 'image' and subtype in IMAGE_MIME_TYPES
 
     def file_data_changed(self, post_init=False):
         attrs_updated = super().file_data_changed(post_init=post_init)
         if attrs_updated:
+            imgfile = None
             try:
                 try:
                     imgfile = self.file.file
@@ -60,16 +129,71 @@ class BaseImage(File):
                     imgfile = self.file_ptr.file
                 imgfile.seek(0)
                 if self.mime_type == 'image/svg+xml':
-                    self._width, self._height = VILImage.load(imgfile).size
+                    self._width, self._height = svg.get_dimensions(imgfile)
+                    self._transparent = True
                 else:
-                    self._width, self._height = PILImage.open(imgfile).size
-                imgfile.seek(0)
+                    pil_image = PILImage.open(imgfile)
+                    self._width, self._height = pil_image.size
+                    self._transparent = easy_thumbnails.utils.is_transparent(pil_image)
             except Exception:
                 if post_init is False:
                     # in case `imgfile` could not be found, unset dimensions
                     # but only if not initialized by loading a fixture file
                     self._width, self._height = None, None
+                    self._transparent = False
+            finally:
+                if imgfile is not None:
+                    # The upload validators read from the same file object, so
+                    # rewind even when reading the dimensions failed - they must
+                    # not be handed an exhausted stream.
+                    try:
+                        imgfile.seek(0)
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to rewind image file stream after metadata read.",
+                            exc_info=exc,
+                        )
         return attrs_updated
+
+    def clean(self):
+        # We check the Image size and calculate the pixel before
+        # the image gets attached to a folder and saved. We also
+        # send the error msg in the JSON and also post the message
+        # so that they know what is wrong with the image they uploaded
+        if not self.file or not FILER_MAX_IMAGE_PIXELS:
+            return
+
+        if self._width is None or self._height is None:
+            if self.mime_type == 'image/svg+xml':
+                # A vector image whose size cannot be read is not a
+                # decompression bomb: there is no pixel count to limit. It is
+                # rendered with a generic icon in the admin instead.
+                return
+            # If image size exceeds Pillow's max image size, Pillow will not return width or height
+            pixels = 2 * FILER_MAX_IMAGE_PIXELS + 1
+            aspect = 16 / 9
+        else:
+            width, height = max(1, self.width), max(1, self.height)
+            pixels: int = width * height
+            aspect: float = width / height
+        res_x: int = int((FILER_MAX_IMAGE_PIXELS * aspect) ** 0.5)
+        res_y: int = int(res_x / aspect)
+        if pixels > 2 * FILER_MAX_IMAGE_PIXELS:
+            msg = _(
+                "Image format not recognized or image size exceeds limit of %(max_pixels)d million "
+                "pixels by a factor of two or more. Before uploading again, check file format or resize "
+                "image to %(width)d x %(height)d resolution or lower."
+            ) % dict(max_pixels=FILER_MAX_IMAGE_PIXELS // 1000000, width=res_x, height=res_y)
+            raise ValidationError(str(msg), code="image_size")
+
+        if pixels > FILER_MAX_IMAGE_PIXELS:
+            msg = _(
+                "Image size (%(pixels)d million pixels) exceeds limit of %(max_pixels)d "
+                "million pixels. Before uploading again, resize image to %(width)d x %(height)d "
+                "resolution or lower."
+            ) % dict(pixels=pixels // 1000000, max_pixels=FILER_MAX_IMAGE_PIXELS // 1000000,
+                     width=res_x, height=res_y)
+            raise ValidationError(str(msg), code="image_size")
 
     def save(self, *args, **kwargs):
         self.has_all_mandatory_data = self._check_validity()
@@ -112,7 +236,8 @@ class BaseImage(File):
             return False
         elif user.is_superuser:
             return True
-        elif user == self.owner:
+        # Compare keys to avoid loading the owner row; a missing owner never matches.
+        elif self.owner_id is not None and self.owner_id == user.pk:
             return True
         elif self.folder:
             return self.folder.has_generic_permission(request, permission_type)
@@ -153,12 +278,14 @@ class BaseImage(File):
 
     @property
     def icons(self):
-        required_thumbnails = dict(
-            (size, {'size': (int(size), int(size)),
-                    'crop': True,
-                    'upscale': True,
-                    'subject_location': self.subject_location})
-            for size in filer_settings.FILER_ADMIN_ICON_SIZES)
+        required_thumbnails = {
+            size: {
+                'size': (int(size), int(size)),
+                'crop': True,
+                'upscale': True,
+                'subject_location': self.subject_location,
+            }
+            for size in filer_settings.FILER_ADMIN_ICON_SIZES}
         return self._generate_thumbnails(required_thumbnails)
 
     @property
@@ -173,10 +300,3 @@ class BaseImage(File):
             thumbnail_storage=self.file.thumbnail_storage,
             thumbnail_basedir=self.file.thumbnail_basedir)
         return tn
-
-    class Meta:
-        app_label = 'filer'
-        verbose_name = _('image')
-        verbose_name_plural = _('images')
-        abstract = True
-        default_manager_name = 'objects'

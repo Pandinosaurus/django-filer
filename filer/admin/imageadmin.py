@@ -6,13 +6,13 @@ from ..settings import FILER_IMAGE_MODEL
 from ..thumbnail_processors import normalize_subject_location
 from ..utils.compatibility import string_concat
 from ..utils.loader import load_model
-from .fileadmin import FileAdmin
+from .fileadmin import FileAdmin, FileAdminChangeFrom
 
 
 Image = load_model(FILER_IMAGE_MODEL)
 
 
-class ImageAdminForm(forms.ModelForm):
+class ImageAdminForm(FileAdminChangeFrom):
     subject_location = forms.CharField(
         max_length=64, required=False,
         label=_('Subject location'),
@@ -44,8 +44,7 @@ class ImageAdminForm(forms.ModelForm):
         for subject location widget to receive valid coordinates on field
         validation errors.
         """
-        cleaned_data = super().clean()
-        subject_location = cleaned_data['subject_location']
+        subject_location = self.cleaned_data['subject_location']
         if not subject_location:
             # if supplied subject location is empty, do not check it
             return subject_location
@@ -58,8 +57,8 @@ class ImageAdminForm(forms.ModelForm):
             err_code = 'invalid_subject_format'
 
         elif (
-            coordinates[0] > self.instance.width
-            or coordinates[1] > self.instance.height
+            coordinates[0] > self.instance.width > 0
+            or coordinates[1] > self.instance.height > 0
         ):
             err_msg = gettext_lazy(
                 'Subject location is outside of the image. ')
@@ -67,7 +66,7 @@ class ImageAdminForm(forms.ModelForm):
         else:
             return subject_location
 
-        self._set_previous_subject_location(cleaned_data)
+        self._set_previous_subject_location(self.cleaned_data)
         raise forms.ValidationError(
             string_concat(
                 err_msg,
@@ -79,14 +78,6 @@ class ImageAdminForm(forms.ModelForm):
     class Meta:
         model = Image
         exclude = ()
-
-    class Media:
-        css = {
-            # 'all': (settings.MEDIA_URL + 'filer/css/focal_point.css',)
-        }
-        js = (
-
-        )
 
 
 class ImageAdmin(FileAdmin):

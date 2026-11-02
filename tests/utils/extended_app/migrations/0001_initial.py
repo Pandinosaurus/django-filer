@@ -18,10 +18,11 @@ class Migration(migrations.Migration):
             fields=[
                 ('_height', models.FloatField(blank=True, null=True)),
                 ('_width', models.FloatField(blank=True, null=True)),
+                ('_transparent', models.BooleanField(null=False, default=False)),
                 ('default_alt_text', models.CharField(blank=True, max_length=255, null=True, verbose_name='default alt text')),
                 ('default_caption', models.CharField(blank=True, max_length=255, null=True, verbose_name='default caption')),
                 ('subject_location', models.CharField(blank=True, default='', max_length=64, verbose_name='subject location')),
-                ('file_ptr', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, parent_link=True, primary_key=True, related_name='extended_app_extimage_file', serialize=False, to='filer.file')),
+                ('file_ptr', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, parent_link=True, primary_key=True, related_name='%(app_label)s_%(class)s_file', serialize=False, to='filer.file')),
             ],
             options={
                 'default_manager_name': 'objects',

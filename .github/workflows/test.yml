@@ -8,30 +8,98 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ 3.6, 3.7, 3.8, 3.9, ]
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
         requirements-file: [
-          django-2.2.txt,
-          django-3.0.txt,
-          django-3.1.txt
+          django-4.2.txt,
+          django-5.1.txt,
+          django-5.2.txt,
+          django-6.0.txt,
+          django-6.1.txt,
+          django-main.txt,
         ]
+        custom-image-model: [false, true]
         os: [
-          ubuntu-20.04,
+          ubuntu-latest,
         ]
+        exclude:
+          - requirements-file: django-main.txt
+            python-version: 3.10
+          - requirements-file: django-main.txt
+            python-version: 3.11
+          - requirements-file: django-6.0.txt
+            python-version: 3.10
+          - requirements-file: django-6.0.txt
+            python-version: 3.11
+          - requirements-file: django-6.1.txt
+            python-version: 3.10
+          - requirements-file: django-6.1.txt
+            python-version: 3.11
+          - requirements-file: django-4.2.txt
+            python-version: 3.14
+          - requirements-file: django-5.1.txt
+            python-version: 3.14
 
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v6
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
+    - name: library prerequisites
+      run: |
+        sudo apt-get update
+        sudo apt-get install python-dev-is-python3 libpq-dev libmagic1 gcc libxml2-dev libxslt1-dev libjpeg62 libopenjp2-7 -y
+    - name: Install extra dependencies
+      run: pip install lxml
+      if: matrix.python-version == '3.10'
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r tests/requirements/${{ matrix.requirements-file }}
-        python setup.py install
-
+        pip install -e .
+    - name: Enable the custom image model
+      run: echo "CUSTOM_IMAGE=custom_image.Image" >> $GITHUB_ENV
+      if: ${{ matrix.custom-image-model }}
     - name: Run coverage
-      run: coverage run setup.py test
-
+      run: coverage run ./tests/settings.py
     - name: Upload Coverage to Codecov
-      uses: codecov/codecov-action@v1
+      uses: codecov/codecov-action@v6
+
+  unit-tests-without-svg-renderer:
+    # svglib and reportlab are the optional django-filer[svg] extra. The matrix
+    # above always has them, so this job covers what a plain "pip install
+    # django-filer" gets: filer reading and thumbnailing SVGs on its own.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+    - name: library prerequisites
+      run: |
+        sudo apt-get update
+        sudo apt-get install python-dev-is-python3 libpq-dev libmagic1 gcc libxml2-dev libxslt1-dev libjpeg62 libopenjp2-7 -y
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r tests/requirements/django-5.2.txt
+        pip install -e .
+    - name: Remove the optional SVG renderer
+      run: pip uninstall -y svglib reportlab
+    - name: Check that it is really gone
+      # Without this the job would silently degrade into a duplicate of the
+      # matrix above if anything ever pulls the renderer back in.
+      run: |
+        python - <<'EOF'
+        import importlib.util
+        import sys
+        still_here = [name for name in ('svglib', 'reportlab')
+                      if importlib.util.find_spec(name) is not None]
+        if still_here:
+            sys.exit(f"{', '.join(still_here)} still installed: this job tests nothing")
+        EOF
+    - name: Run coverage
+      run: coverage run ./tests/settings.py
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v6

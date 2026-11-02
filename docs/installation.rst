@@ -10,14 +10,56 @@ The easiest way to get ``django-filer`` is simply install it with `pip`_::
 
     $ pip install django-filer
 
+Optional heic support
+---------------------
+
+Currently, django-filer supports upload of heif images (``*.heic``, such as
+retrieved from iOS devices by airdrop) using an optional dependency::
+
+    $ pip install django-filer\[heif\]
+
+.. _optional_svg_support:
+
+Optional SVG renderer
+---------------------
+
+django-filer reads the size of an SVG and scales or crops it by rewriting the
+document itself, so SVG uploads and thumbnails work out of the box. Documents
+that state their size only in relative units (``width="100%"`` without a
+``viewBox``, say) cannot be measured that way. If you have such files, install
+the optional SVG renderer, which derives their size by drawing them::
+
+    $ pip install django-filer\[svg\]
+
+This pulls in `svglib`_ and `reportlab`_ through ``easy-thumbnails[svg]``.
+Before version 3.6, django-filer always installed them.
+
+
+Optional avif support
+---------------------
+
+django-filer treats avif images (``*.avif``, ``*.avifs``) as images if Pillow can
+decode them. `Pillow`_ does so out of the box since Pillow 11.3 (its wheels bundle
+libaom and dav1d). With older Pillow versions install the optional
+`pillow-avif-plugin`_ dependency::
+
+    $ pip install django-filer\[avif\]
+
+If neither is available, avif uploads are kept as regular files instead of images.
+
+.. note::
+
+    avif files uploaded *before* avif support became available stay regular files:
+    django-filer decides on the model class at upload time. Re-upload them to turn
+    them into images.
+
 
 Dependencies
 ------------
 
-* `Django`_ >= 2.2
-* `django-mptt`_ >=0.6
+* `Django`_ >= 3.2
 * `easy_thumbnails`_ >= 2.0
-* `django-polymorphic`_ >= 0.7
+* `django-polymorphic`_ >= 3.0
 * `Pillow`_ >=2.3.0 (with JPEG and ZLIB support, `PIL`_ may work but is not supported)
 
 ``django.contrib.staticfiles`` is required.
@@ -26,11 +68,19 @@ Please make sure you install `Pillow`_ with JPEG and  ZLIB support installed;
 for further information on Pillow installation and its binary dependencies,
 check `Pillow doc`_.
 
-`django-polymorphic`_ version depends on `Django`_ version:
+If heif support is chosen, django-filer also installs
 
-* for `Django`_ >=2.2 use `django-polymorphic`_ >=2.0
-* for `Django`_ >=3.0 use `django-polymorphic`_ >=2.1
-* for `Django`_ >=3.1 use `django-polymorphic`_ >=3.0
+* pillow-heif
+
+If avif support is chosen, django-filer also installs
+
+* pillow-avif-plugin (only needed for Pillow < 11.3)
+
+If the optional SVG renderer is chosen, django-filer also installs
+
+* svglib
+* reportlab
+
 
 Configuration
 -------------
@@ -41,7 +91,6 @@ Add ``"filer"`` and related apps to your project's ``INSTALLED_APPS`` setting an
         ...
         'easy_thumbnails',
         'filer',
-        'mptt',
         ...
     ]
 
@@ -76,6 +125,18 @@ To enable automatic subject location aware cropping of images replace
         'filer.thumbnail_processors.scale_and_crop_with_subject_location',
         'easy_thumbnails.processors.filters',
     )
+
+.. IMPORTANT::
+
+    Keep ``easy_thumbnails.processors.colorspace`` as the first entry of
+    ``THUMBNAIL_PROCESSORS`` (it is part of easy-thumbnails' default chain).
+    This processor converts indexed/palette images – most notably GIFs, which
+    use Pillow's ``P`` mode – into ``RGB`` (or ``RGBA`` for transparent images).
+    Thumbnails are saved as JPEG by default, and the JPEG encoder cannot write
+    palette images: without ``colorspace`` running first, generating a thumbnail
+    for such a file fails with ``OSError: cannot write mode P as JPEG`` (see
+    issue #1601). Because it has to run before the image is resized, it must
+    come before the scaling/cropping processors.
 
 To crop an image and respect the subject location::
 
@@ -146,10 +207,12 @@ generation errors,  two options are provided to help when working with ``django-
 .. _Django: http://djangoproject.com
 .. _django-polymorphic: https://github.com/bconstantin/django_polymorphic
 .. _easy_thumbnails: https://github.com/SmileyChris/easy-thumbnails
+.. _svglib: https://github.com/deeplook/svglib
+.. _reportlab: https://www.reportlab.com/
 .. _sorl.thumbnail: http://thumbnail.sorl.net/
-.. _django-mptt: https://github.com/django-mptt/django-mptt/
 .. _Pillow: http://pypi.python.org/pypi/Pillow/
 .. _Pillow doc: https://pillow.readthedocs.io/en/latest/installation.html
 .. _PIL: http://www.pythonware.com/products/pil/
+.. _pillow-avif-plugin: https://pypi.org/project/pillow-avif-plugin/
 .. _pip: http://pypi.python.org/pypi/pip
 .. _South: http://south.aeracode.org/

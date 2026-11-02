@@ -1,14 +1,10 @@
 import os
 
+from django import VERSION as DJANGO_VERSION
 from django.conf import settings
 from django.core.files import File as DjangoFile
 from django.forms.models import modelform_factory
 from django.test import TestCase
-
-from tests.helpers import (
-    create_clipboard_item, create_folder_structure, create_image,
-    create_superuser,
-)
 
 from filer import settings as filer_settings
 from filer.models.clipboardmodels import Clipboard
@@ -17,9 +13,88 @@ from filer.models.foldermodels import Folder
 from filer.models.mixins import IconsMixin
 from filer.settings import FILER_IMAGE_MODEL
 from filer.utils.loader import load_model
+from tests.helpers import create_clipboard_item, create_folder_structure, create_image, create_superuser
 
 
 Image = load_model(FILER_IMAGE_MODEL)
+
+
+class DuplicateQueryTests(TestCase):
+    def test_duplicate_group_queries(self):
+        for size in (5, 20):
+            with self.subTest(size=size):
+                File.objects.all().delete()
+                digest = str(size).zfill(40)
+                files = File.objects.bulk_create([
+                    File(name=f'file-{index}', sha1=digest, _file_size=1)
+                    for index in range(size)
+                ])
+
+                # Discovery also materializes groups, without one query per digest.
+                with self.assertNumQueries(1):
+                    duplicates = File.objects.find_all_duplicates()
+                    self.assertEqual(list(duplicates), [digest])
+
+                with self.assertNumQueries(0):
+                    self.assertCountEqual(duplicates[digest], files)
+
+    def test_duplicate_groups_match(self):
+        files = File.objects.bulk_create([
+            File(name=str(index), sha1=digest, _file_size=1)
+            for index, digest in enumerate(('', '', 'unique', 'first', 'first', 'second', 'second'))
+        ])
+
+        duplicates = File.objects.find_all_duplicates()
+
+        self.assertCountEqual(duplicates, ['first', 'second'])
+        self.assertCountEqual(duplicates['first'], files[3:5])
+        self.assertCountEqual(duplicates['second'], files[5:7])
+
+    def test_groups_are_querysets(self):
+        files = File.objects.bulk_create([
+            File(name=str(index), sha1='first', _file_size=1) for index in range(3)
+        ])
+        group = File.objects.find_all_duplicates()['first']
+
+        self.assertEqual(group.count(), 3)
+        group.exclude(pk=files[0].pk).delete()
+        self.assertEqual(list(File.objects.values_list('pk', flat=True)), [files[0].pk])
+
+    def test_groups_are_snapshots(self):
+        files = File.objects.bulk_create([
+            File(name=str(index), sha1=digest, _file_size=1)
+            for index, digest in enumerate(('first', 'first', 'second', 'second'))
+        ])
+        duplicates = File.objects.find_all_duplicates()
+        File.objects.filter(pk=files[0].pk).update(sha1='changed')
+
+        with self.assertNumQueries(0):
+            self.assertCountEqual(duplicates['first'], files[:2])
+            self.assertCountEqual(duplicates['second'], files[2:])
+
+    def test_mostly_unique_digests(self):
+        for size in (20, 100):
+            with self.subTest(size=size):
+                File.objects.all().delete()
+                File.objects.bulk_create([
+                    File(name=str(index), sha1=str(index).zfill(40), _file_size=1)
+                    for index in range(size)
+                ])
+                with self.assertNumQueries(1):
+                    self.assertEqual(File.objects.find_all_duplicates(), {})
+
+    def test_duplicates_keep_subtypes(self):
+        digest = 'a' * 40
+        file = File.objects.create(name='file', _file_size=1)
+        image = Image.objects.create(name='image', _file_size=1)
+        File.objects.filter(pk__in=(file.pk, image.pk)).update(sha1=digest, _file_size=1)
+
+        duplicates = File.objects.find_all_duplicates()
+
+        matches = {item.pk: item for item in duplicates[digest]}
+        self.assertEqual(set(matches), {file.pk, image.pk})
+        self.assertIsInstance(matches[file.pk], File)
+        self.assertIsInstance(matches[image.pk], Image)
 
 
 class FilerApiTests(TestCase):
@@ -38,9 +113,11 @@ class FilerApiTests(TestCase):
         for f in File.objects.all():
             f.delete()
 
-    def create_filer_image(self):
+    def create_filer_image(self, owner=None):
+        if owner is None:
+            owner = self.superuser
         file_obj = DjangoFile(open(self.filename, 'rb'), name=self.image_name)
-        image = Image.objects.create(owner=self.superuser,
+        image = Image.objects.create(owner=owner,
                                      original_filename=self.image_name,
                                      file=file_obj)
         return image
@@ -66,6 +143,7 @@ class FilerApiTests(TestCase):
             'original_filename': self.image_name,
             'owner': self.superuser.pk
         }, {'file': file_obj})
+        self.assertTrue(upoad_image_form.is_valid())
         if upoad_image_form.is_valid():
             image = upoad_image_form.save()  # noqa
         self.assertEqual(Image.objects.count(), 1)
@@ -87,19 +165,19 @@ class FilerApiTests(TestCase):
         self.assertEqual(len(icons), len(filer_settings.FILER_ADMIN_ICON_SIZES))
         for size in filer_settings.FILER_ADMIN_ICON_SIZES:
             self.assertEqual(os.path.basename(icons[size]),
-                             file_basename + '__%sx%s_q85_crop_subsampling-2_upscale.jpg' % (size, size))
+                             file_basename + '__{}x{}_q85_crop_subsampling-2_upscale.jpg'.format(size, size))
 
     def test_access_icons_property(self):
         """Test IconsMixin that calls static on a non-existent file"""
 
-        class CustomObj(IconsMixin, object):
+        class CustomObj(IconsMixin):
             _icon = 'custom'
 
         custom_obj = CustomObj()
         try:
             icons = custom_obj.icons
         except Exception as e:
-            self.fail("'.icons' access raised Exception {0} unexpectedly!".format(e))
+            self.fail(f"'.icons' access raised Exception {e} unexpectedly!")
         self.assertEqual(len(icons), len(filer_settings.FILER_ADMIN_ICON_SIZES))
 
     def test_file_upload_public_destination(self):
@@ -211,16 +289,25 @@ class FilerApiTests(TestCase):
         # file should still be here
         self.assertTrue(storage.exists(name))
 
-    def test_folder_quoted_logical_path(self):
+    def test_folder_pretty_logical_path(self):
         root_folder = Folder.objects.create(name="Foo's Bar", parent=None)
         child = Folder.objects.create(name='Bar"s Foo', parent=root_folder)
-        self.assertEqual(child.quoted_logical_path, '/Foo%27s%20Bar/Bar%22s%20Foo')
+        if DJANGO_VERSION < (3,):
+            self.assertEqual(child.pretty_logical_path, '/Foo&#39;s Bar/Bar&quot;s Foo')
+        else:
+            self.assertEqual(child.pretty_logical_path, '/Foo&#x27;s Bar/Bar&quot;s Foo')
 
-    def test_folder_quoted_logical_path_with_unicode(self):
+    def test_folder_pretty_logical_path_with_unicode(self):
         root_folder = Folder.objects.create(name="Foo's Bar", parent=None)
         child = Folder.objects.create(name='Bar"s 日本 Foo', parent=root_folder)
-        self.assertEqual(child.quoted_logical_path,
-                         '/Foo%27s%20Bar/Bar%22s%20%E6%97%A5%E6%9C%AC%20Foo')
+        if DJANGO_VERSION < (3,):
+            self.assertEqual(child.pretty_logical_path, '/Foo&#39;s Bar/Bar&quot;s 日本 Foo')
+        else:
+            self.assertEqual(child.pretty_logical_path, '/Foo&#x27;s Bar/Bar&quot;s 日本 Foo')
+
+    def test_folder_str_method(self):
+        root_folder = Folder.objects.create(name="Foo's Bar", parent=None)
+        self.assertEqual(root_folder.pretty_logical_path, str(root_folder))
 
     def test_custom_model(self):
         """
@@ -296,3 +383,22 @@ class FilerApiTests(TestCase):
         image.save()
         canonical = image.canonical_url
         self.assertTrue(canonical.startswith('/filer/test-path/'))
+
+    def test_delete_user_who_owns_file(self):
+        """Tests if deleting users who own files works"""
+        from django.contrib.auth.models import User
+
+        user = User.objects.create(
+            username="test",
+            password="top-secret",
+            email="community-hero@django-cms.org",
+            is_staff=True,
+        )
+        image = self.create_filer_image(user)
+
+        user.delete()
+
+        # User needs to be gone
+        self.assertEqual(len(User.objects.filter(username="test")), 0)
+        # Image remains w/o owner
+        self.assertIsNone(File.objects.get(pk=image.pk).owner)

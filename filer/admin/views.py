@@ -3,14 +3,14 @@ from django.contrib import admin
 from django.contrib.admin import widgets
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
-from django.http import HttpResponseRedirect
+from django.db import IntegrityError, router, transaction
 from django.http.response import HttpResponseBadRequest
-from django.shortcuts import render
+from django.template.response import TemplateResponse
 from django.utils.translation import gettext_lazy as _
 
 from .. import settings as filer_settings
-from ..models import Clipboard, Folder, FolderRoot, tools
-from .tools import AdminContext, admin_url_params_encoded, popup_status
+from ..models import Folder, FolderRoot
+from .tools import AdminContext, popup_status
 
 
 class NewFolderForm(forms.ModelForm):
@@ -47,7 +47,9 @@ def make_folder(request, folder_id=None):
         raise PermissionDenied
 
     if request.method == 'POST':
-        new_folder_form = NewFolderForm(request.POST)
+        new_folder_form = NewFolderForm(
+            request.POST, instance=Folder(parent=folder, owner=request.user),
+        )
         if new_folder_form.is_valid():
             new_folder = new_folder_form.save(commit=False)
             if (folder or FolderRoot()).contains_folder(new_folder.name):
@@ -55,10 +57,17 @@ def make_folder(request, folder_id=None):
                     [_('Folder with this name already exists.')])
             else:
                 context = admin.site.each_context(request)
-                new_folder.parent = folder
-                new_folder.owner = request.user
-                new_folder.save()
-                return render(request, 'admin/filer/dismiss_popup.html', context)
+                using = router.db_for_write(Folder, instance=new_folder)
+                try:
+                    with transaction.atomic(using=using):
+                        new_folder.save(using=using)
+                except IntegrityError:
+                    # The name may have been taken since the form was validated.
+                    if not Folder.objects.using(using).filter(parent=folder, name=new_folder.name).exists():
+                        raise
+                    new_folder_form.add_error('name', _('Folder with this name already exists.'))
+                else:
+                    return TemplateResponse(request, 'admin/filer/dismiss_popup.html', context)
     else:
         new_folder_form = NewFolderForm()
 
@@ -69,63 +78,22 @@ def make_folder(request, folder_id=None):
         'is_popup': popup_status(request),
         'filer_admin_context': AdminContext(request),
     })
-    return render(request, 'admin/filer/folder/new_folder_form.html', context)
+    return TemplateResponse(request, 'admin/filer/folder/new_folder_form.html', context)
 
 
+# The clipboard operations are no longer part of the file browser. The views are
+# kept - and answer 400 - so that projects still linking to them do not run into
+# a NoReverseMatch.
 @login_required
 def paste_clipboard_to_folder(request):
-    if True:
-        # TODO: cleanly remove Clipboard code if it is no longer needed
-        return HttpResponseBadRequest('not implemented anymore')
-
-    if request.method == 'POST':
-        folder = Folder.objects.get(id=request.POST.get('folder_id'))
-        clipboard = Clipboard.objects.get(id=request.POST.get('clipboard_id'))
-        if folder.has_add_children_permission(request):
-            tools.move_files_from_clipboard_to_folder(clipboard, folder)
-            tools.discard_clipboard(clipboard)
-        else:
-            raise PermissionDenied
-    redirect = request.GET.get('redirect_to', '')
-    if not redirect:
-        redirect = request.POST.get('redirect_to', '')
-    return HttpResponseRedirect(
-        '{0}?order_by=-modified_at{1}'.format(
-            redirect,
-            admin_url_params_encoded(request, first_separator='&'),
-        )
-    )
+    return HttpResponseBadRequest('not implemented anymore')
 
 
 @login_required
 def discard_clipboard(request):
-    if True:
-        # TODO: cleanly remove Clipboard code if it is no longer needed
-        return HttpResponseBadRequest('not implemented anymore')
-
-    if request.method == 'POST':
-        clipboard = Clipboard.objects.get(id=request.POST.get('clipboard_id'))
-        tools.discard_clipboard(clipboard)
-    return HttpResponseRedirect(
-        '{0}{1}'.format(
-            request.POST.get('redirect_to', ''),
-            admin_url_params_encoded(request, first_separator='&'),
-        )
-    )
+    return HttpResponseBadRequest('not implemented anymore')
 
 
 @login_required
 def delete_clipboard(request):
-    if True:
-        # TODO: cleanly remove Clipboard code if it is no longer needed
-        return HttpResponseBadRequest('not implemented anymore')
-
-    if request.method == 'POST':
-        clipboard = Clipboard.objects.get(id=request.POST.get('clipboard_id'))
-        tools.delete_clipboard(clipboard)
-    return HttpResponseRedirect(
-        '{0}{1}'.format(
-            request.POST.get('redirect_to', ''),
-            admin_url_params_encoded(request, first_separator='&'),
-        )
-    )
+    return HttpResponseBadRequest('not implemented anymore')

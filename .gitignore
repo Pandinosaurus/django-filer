@@ -4,6 +4,7 @@
 *.log
 *.pot
 .DS_Store
+.coverage
 .coverage/
 .eggs/
 .idea/
@@ -13,16 +14,17 @@
 .settings/
 .tox/
 __pycache__/
-build/
-dist/
+docs/_build/
+/dist
 env/
 .venv/
+/*docs/env*/
+/*docs/_build*/
 
 /~
 /node_modules
 .sass-cache
 *.css.map
-package-lock.json
 
 local.sqlite
 
@@ -39,3 +41,4 @@ pep8.txt
 share/
 .python-version
 data
+local.sqlite

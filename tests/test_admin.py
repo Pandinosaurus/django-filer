@@ -1,29 +1,49 @@
+import json
 import os
-from unittest import skipIf
+import unittest
 
 import django
 import django.core.files
+from django import VERSION as DJANGO_VERSION
+from django.apps import apps
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.admin import helpers
+from django.contrib.admin.models import DELETION, LogEntry
+from django.contrib.admin.templatetags.admin_urls import admin_urlname
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
+from django.contrib.messages import ERROR, get_messages
+from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.forms.models import model_to_dict as model_to_dict_django
-from django.test import TestCase
+from django.http import HttpRequest, HttpResponseForbidden
+from django.template import Context, Template
+from django.test import RequestFactory, TestCase
 from django.urls import reverse
+from django.utils.html import escape
 
-from tests.helpers import (
-    SettingsOverride, create_folder_structure, create_image, create_superuser,
-)
-from tests.utils.extended_app.models import ExtImage, Video
+from easy_thumbnails.files import get_thumbnailer
+from easy_thumbnails.options import ThumbnailOptions
 
 from filer import settings as filer_settings
+from filer.admin import tools
 from filer.admin.folderadmin import FolderAdmin
+from filer.models import abstract
 from filer.models.filemodels import File
 from filer.models.foldermodels import Folder, FolderPermission
 from filer.models.virtualitems import FolderRoot
-from filer.settings import FILER_IMAGE_MODEL
+from filer.settings import DEFERRED_THUMBNAIL_SIZES, FILER_IMAGE_MODEL, FILER_THUMBNAIL_ICON_SIZE
+from filer.templatetags.filer_admin_tags import (
+    django_version_gte,
+    file_icon_url,
+    get_aspect_ratio_and_download_url,
+)
 from filer.thumbnail_processors import normalize_subject_location
+from filer.utils.compatibility import PILImage
 from filer.utils.loader import load_model
+from tests.helpers import SettingsOverride, create_folder_structure, create_image, create_superuser
+from tests.utils.extended_app.models import ExtImage, Video
 
 
 Image = load_model(FILER_IMAGE_MODEL)
@@ -69,6 +89,23 @@ class FilerFolderAdminUrlsTests(TestCase):
         # TODO: not sure why the status code is 200
         self.assertEqual(response.status_code, 200)
 
+    def test_filer_make_root_folder_post_with_name_of_subfolder(self):
+        parent = Folder.objects.create(name="parent")
+        Folder.objects.create(name="sub", parent=parent)
+        url = reverse('admin:filer-directory_listing-make_root_folder')
+
+        with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
+            # A subfolder with the same name does not block a new root folder
+            response = self.client.post(url, {"name": "sub"})
+            self.assertEqual(response.status_code, 200)
+            self.assertNotContains(response, "Folder with this name already exists.")
+            self.assertTrue(Folder.objects.filter(parent__isnull=True, name="sub").exists())
+
+            # A root folder with the same name does
+            response = self.client.post(url, {"name": "sub"})
+            self.assertContains(response, "Folder with this name already exists.")
+            self.assertEqual(Folder.objects.filter(parent__isnull=True, name="sub").count(), 1)
+
     def test_filer_remember_last_opened_directory(self):
         folder = Folder.objects.create(name='remember me please')
 
@@ -92,6 +129,72 @@ class FilerFolderAdminUrlsTests(TestCase):
         response = self.client.get(reverse('admin:filer-directory_listing-root'))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.context['folder'].children.count(), 6)
+
+    def test_filer_directory_listing_performance(self):
+        # Any number of images > then the number of allowed queries to ensure that images do not trigger individual
+        # queries.
+        images = 10
+
+        thumbnail_urls = []
+        for i in range(images):
+            filename = f'test_image_{i}.jpg'
+            os_filename = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, filename)
+            create_image().save(os_filename, 'JPEG')
+            with open(os_filename, 'rb') as f:
+                file_obj = django.core.files.File(f, name=filename)
+                image_obj = Image.objects.create(owner=self.superuser, original_filename=filename, file=file_obj, mime_type='image/jpeg')
+                image_obj.save()
+                thumbnailer = get_thumbnailer(image_obj)
+                thumbnail_options = ThumbnailOptions({"size": (40, 40), "crop": True})
+                thumbnail_urls.append(thumbnailer.get_thumbnail(thumbnail_options).url)
+
+        self.assertEqual(Image.objects.count(), images)
+        # Polymorphic resolves content types once per process: warm that cache so
+        # that the query count does not depend on which tests ran before
+        self.client.get(reverse('admin:filer-directory_listing-unfiled_images'))
+        with self.assertNumQueries(4):
+            # Expected queries:
+            # 1. Authentication check
+            # 2. Count files without materializing the directory
+            # 3. Load the page and thumbnail annotations
+            # 4. Select polymorphic image and owner data
+            response = self.client.get(reverse('admin:filer-directory_listing-unfiled_images'))
+        self.assertContains(response, "test_image_0.jpg")
+        self.assertContains(response, "/media/my-preferred-base-url-for-source-files/")
+        self.assertContains(response, "/media/my-preferred-base-url-for-thumbnails/")
+        for thumbnail_url in thumbnail_urls:
+            self.assertContains(response, thumbnail_url)
+
+    def test_folder_counts_batched(self):
+        parent = Folder.objects.create(name='parent')
+        populated = Folder.objects.create(name='populated', parent=parent)
+        empty = Folder.objects.create(name='empty', parent=parent)
+        Folder.objects.bulk_create([
+            Folder(name=f'child-{index}', parent=populated) for index in range(2)
+        ])
+        File.objects.bulk_create([
+            File(name=f'file-{index}', folder=populated) for index in range(3)
+        ])
+        request = RequestFactory().get('/')
+        request.user = self.superuser
+        request.session = {}
+        folder_admin = admin.site._registry[Folder]
+
+        for query in ('', 'p', 'empty'):
+            with self.subTest(query=query):
+                request.GET = request.GET.copy()
+                request.GET['q'] = query
+                response = folder_admin.directory_listing(request, parent.pk)
+                folders = list(response.context_data['folder_children'])
+
+                # Counts must be available without per-folder queries, including search.
+                with self.assertNumQueries(0):
+                    counts = {folder.pk: (folder.children_count, folder.file_count) for folder in folders}
+
+                if query != 'empty':
+                    self.assertEqual(counts[populated.pk], (2, 3))
+                if query != 'p':
+                    self.assertEqual(counts[empty.pk], (0, 0))
 
     def test_validate_no_duplicate_folders(self):
         FOLDER_NAME = "root folder 1"
@@ -154,8 +257,6 @@ class FilerFolderAdminUrlsTests(TestCase):
         folder = Folder.objects.get(pk=folder.pk)
         self.assertEqual(folder.owner.pk, another_superuser.pk)
 
-    @skipIf(django.get_version() < '1.7',
-            'admin context not supported in django < 1.7')
     def test_folder_admin_uses_admin_context(self):
         folder = Folder.objects.create(name='foo')
         url = reverse('admin:filer-directory_listing', kwargs={
@@ -191,14 +292,303 @@ class FilerFolderAdminUrlsTests(TestCase):
             for action in (actions_with_permissions + actions):
                 self.assertContains(response, action)
 
+    def test_filer_list_type_query_string(self):
+        response = self.client.get(reverse('admin:filer-directory_listing-root') + "?_list_type=th")
+        self.assertContains(response, 'navigator-thumbnail-list')
+
+        response = self.client.get(reverse('admin:filer-directory_listing-root') + "?_list_type=tb")
+        self.assertContains(response, 'navigator-table')
+
+    def test_filer_list_type_setting(self):
+        with SettingsOverride(filer_settings, FILER_FOLDER_ADMIN_DEFAULT_LIST_TYPE='th'):
+            response = self.client.get(reverse('admin:filer-directory_listing-root'))
+            self.assertContains(response, 'navigator-thumbnail-list')
+
+    def test_filer_list_type_setting_when_user_set_wrong_choice(self):
+        # If choice not exists then it should set table view as default
+        with SettingsOverride(settings, FILER_FOLDER_ADMIN_DEFAULT_LIST_TYPE='qwerty'):
+            # `settings` instead of `filer_settings` to give chance filer_settings
+            # conditional to fire up
+            response = self.client.get(reverse('admin:filer-directory_listing-root'))
+            self.assertContains(response, 'navigator-table')
+
+    def test_filer_list_type_setting_when_use_wrong_query_string_choice(self):
+        # If list type in query string not exists show default list type
+        with SettingsOverride(filer_settings, FILER_FOLDER_ADMIN_DEFAULT_LIST_TYPE='th'):
+            response = self.client.get(reverse('admin:filer-directory_listing-root') + "?_list_type=qwerty")
+            self.assertContains(response, 'navigator-thumbnail-list')
+
 
 class FilerImageAdminUrlsTests(TestCase):
     def setUp(self):
         self.superuser = create_superuser()
         self.client.login(username='admin', password='secret')
+        self.img = create_image()
+        self.image_name = 'test_file.jpg'
+        self.filename = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, self.image_name)
+        self.img.save(self.filename, 'JPEG')
+        with open(self.filename, 'rb') as upload:
+            self.file_object = Image.objects.create(file=django.core.files.File(upload, name=self.image_name))
 
     def tearDown(self):
         self.client.logout()
+        os.remove(self.filename)
+
+    def test_icon_view_sizes(self):
+        """Redirects are issued for accepted thumbnail sizes and 404 otherwise"""
+        test_set = tuple((size, 302) for size in DEFERRED_THUMBNAIL_SIZES)
+        test_set += (50, 404), (90, 404), (640, 404)
+        for size, expected_status in test_set:
+            url = reverse('admin:filer_file_fileicon', kwargs={
+                'file_id': self.file_object.pk,
+                'size': size,
+            })
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, expected_status)
+            if response.status_code == 302:  # redirect
+                # Redirects to a media file
+                self.assertIn("/media/", response["Location"])
+                # Does not redirect to a static file
+                self.assertNotIn("/static/", response["Location"])
+
+    def test_focal_point_only_where_it_can_be_saved(self):
+        """The preview doubles as focal point widget only if the form has the field"""
+        # The image admin offers the subject location, so the preview is a focal point
+        response = self.client.get(reverse(admin_urlname(Image._meta, 'change'),
+                                           kwargs={'object_id': self.file_object.pk}))
+
+        self.assertContains(response, 'id="id_subject_location"')
+        self.assertContains(response, 'js-focal-point')
+        self.assertContains(response, 'data-location-selector="#id_subject_location"')
+
+        # The file admin shows the same image but has no subject location field:
+        # a focal point there would silently drop what the user does (#1579)
+        response = self.client.get(reverse(admin_urlname(File._meta, 'change'),
+                                           kwargs={'object_id': self.file_object.pk}))
+
+        self.assertNotContains(response, 'id="id_subject_location"')
+        self.assertNotContains(response, 'js-focal-point')
+        # ... the preview itself is still shown
+        self.assertContains(response, 'width="210"')
+
+    def test_missing_file(self):
+        """Directory shows static icon for missing files"""
+        image = Image.objects.create(
+            owner=self.superuser,
+            original_filename="some-image.jpg",
+        )
+        url = reverse('admin:filer_file_fileicon', kwargs={
+            'file_id': image.pk,
+            'size': 80,
+        })
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("icons/file-missing.svg", response["Location"])
+
+    def test_icon_view_palette_gif(self):
+        """A palette-mode GIF generates a JPEG thumbnail with ``colorspace`` (#1601)
+
+        The ``colorspace`` processor converts the palette ("P") image to RGB, so
+        the JPEG thumbnail can be written and a real thumbnail is returned.
+        """
+        gif_name = 'palette.gif'
+        gif_path = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, gif_name)
+        create_image(mode='P', size=(200, 150)).save(gif_path, 'GIF')
+        try:
+            with open(gif_path, 'rb') as upload:
+                image = Image.objects.create(
+                    file=django.core.files.File(upload, name=gif_name),
+                )
+            url = reverse('admin:filer_file_fileicon', kwargs={
+                'file_id': image.pk,
+                'size': 80,
+            })
+            response = self.client.get(url)
+
+            self.assertEqual(response.status_code, 302)
+            # A real (media) thumbnail is generated, not the missing-file icon.
+            self.assertIn("/media/", response["Location"])
+            self.assertNotIn("icons/file-missing.svg", response["Location"])
+        finally:
+            os.remove(gif_path)
+
+    def test_icon_view_unencodable_image(self):
+        """Icon generation degrades gracefully when a thumbnail can't be encoded (#1601)
+
+        If ``colorspace`` is not part of ``THUMBNAIL_PROCESSORS``, a palette-mode
+        ("P") GIF reaches the JPEG encoder unchanged and raises
+        ``OSError: cannot write mode P as JPEG``. The icon view must fall back to
+        the missing-file icon instead of returning a 500.
+        """
+        gif_name = 'palette.gif'
+        gif_path = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, gif_name)
+        create_image(mode='P', size=(200, 150)).save(gif_path, 'GIF')
+        try:
+            with open(gif_path, 'rb') as upload:
+                image = Image.objects.create(
+                    file=django.core.files.File(upload, name=gif_name),
+                )
+            url = reverse('admin:filer_file_fileicon', kwargs={
+                'file_id': image.pk,
+                'size': 80,
+            })
+            with SettingsOverride(settings, THUMBNAIL_PROCESSORS=(
+                'easy_thumbnails.processors.autocrop',
+                'filer.thumbnail_processors.scale_and_crop_with_subject_location',
+                'easy_thumbnails.processors.filters',
+            )):
+                response = self.client.get(url)
+
+            self.assertEqual(response.status_code, 302)
+            self.assertIn("icons/file-missing.svg", response["Location"])
+        finally:
+            os.remove(gif_path)
+
+    def test_icon_view_non_image(self):
+        """Getting an icon for a non-image results in a 404"""
+        file = File.objects.create(
+            owner=self.superuser,
+            original_filename="some-file.xyz",
+        )
+        url = reverse('admin:filer_file_fileicon', kwargs={
+            'file_id': file.pk,
+            'size': 80,
+        })
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_detail_view_missing_file(self):
+        """Detail view shows static icon for missing file"""
+        image = Image.objects.create(
+            owner=self.superuser,
+            original_filename="some-image.jpg",
+        )
+        image._width = 50
+        image._height = 200
+        image.save()
+
+        url = reverse(admin_urlname(Image._meta, 'change'), kwargs={
+            'object_id': image.pk,
+        })
+
+        response = self.client.get(url)
+
+        self.assertContains(response, "icons/file-missing.svg")
+        self.assertContains(response, 'width="210"')
+        self.assertContains(response, 'height="210"')
+        self.assertContains(response, 'alt="File is missing"')
+
+    def test_image_expand_link_in_change_view(self):
+        files = [
+            # Files can use the same contents for this test - it's the MIME type that counts
+            File.objects.create(owner=self.superuser, original_filename='some-file.txt', file=self.file_object.file),
+            Image.objects.create(owner=self.superuser, original_filename='some-image.jpg'),  # missing file
+            Image.objects.create(owner=self.superuser, original_filename='some-image.jpg', file=self.file_object.file),
+            Image.objects.create(owner=self.superuser, original_filename='some-image.svg', file=self.file_object.file),
+            # SVGs are not necessarily stored as Image, see #1590
+            File.objects.create(owner=self.superuser, original_filename='some-file.svg', file=self.file_object.file),
+        ]
+        test_set = [
+            (files[0], 'text/plain', False),
+            (files[1], 'image/jpeg', False),
+            (files[2], 'image/jpeg', True),
+            (files[3], 'image/svg+xml', True),
+            (files[4], 'image/svg+xml', True),
+        ]
+        for file, mime_type, has_expand_link in test_set:
+            file.mime_type = mime_type
+            file.save()
+            models = [File]
+            if isinstance(file, Image):
+                models.append(Image)
+            for model in models:
+                response = self.client.get(reverse(admin_urlname(model._meta, 'change'),
+                                                   kwargs={'object_id': file.pk}))
+                if not has_expand_link:
+                    self.assertNotContains(response, 'filer-icon-expand')
+                elif 'svg' in mime_type:
+                    # Each admin links to its own expand view, so that the file can be
+                    # looked up by the model the admin is registered for
+                    expected_url = reverse(admin_urlname(model._meta, 'expand'), args=(file.pk,))
+                    self.assertContains(response, f'href="{expected_url}"')
+                else:
+                    self.assertContains(response, f'href="{file.file.url}"')
+
+    def test_image_expand_view(self):
+        url = reverse(admin_urlname(Image._meta, 'expand'), kwargs={
+            'file_id': self.file_object.pk
+        })
+        original_url = self.file_object.url
+
+        response = self.client.get(url)
+
+        self.assertEqual(url, self.file_object.get_admin_expand_view_url())
+        self.assertContains(
+            response,
+            f"""<img id="img" src="{original_url}" alt="{escape(self.file_object.label)}" """
+        )
+        self.assertContains(response, f"<title>{escape(self.file_object.label)}</title>")
+        self.assertContains(response, '<html lang="')
+
+    def test_file_expand_view(self):
+        """SVGs stored as File (not Image) have an expand view, too, see #1590"""
+        file = File.objects.create(
+            owner=self.superuser,
+            original_filename='some-file.svg',
+            file=self.file_object.file,
+            mime_type='image/svg+xml',
+        )
+        url = reverse(admin_urlname(File._meta, 'expand'), kwargs={'file_id': file.pk})
+
+        response = self.client.get(url)
+
+        self.assertEqual(url, file.get_admin_expand_view_url())
+        self.assertContains(
+            response,
+            f"""<img id="img" src="{file.url}" alt="{escape(file.label)}" """
+        )
+
+    def test_expand_view_requires_read_permission(self):
+        """The expand view does not disclose files the user may not read"""
+        file = File.objects.create(
+            owner=self.superuser,
+            original_filename='some-file.svg',
+            file=self.file_object.file,
+            mime_type='image/svg+xml',
+            folder=Folder.objects.create(name='svgs', owner=self.superuser),
+        )
+        url = reverse(admin_urlname(File._meta, 'expand'), kwargs={'file_id': file.pk})
+
+        with unittest.mock.patch.object(File, 'has_read_permission', return_value=False):
+            response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_directory_listing_with_svg_file(self):
+        """A folder containing an SVG stored as File can be listed, see #1590"""
+        folder = Folder.objects.create(name='svgs', owner=self.superuser)
+        file = File.objects.create(
+            owner=self.superuser,
+            original_filename='some-file.svg',
+            file=self.file_object.file,
+            folder=folder,
+        )
+        # The MIME type is what counts, it is reset when the file contents change
+        file.mime_type = 'image/svg+xml'
+        file.save()
+
+        response = self.client.get(reverse('admin:filer-directory_listing',
+                                           kwargs={'folder_id': folder.pk}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            reverse(admin_urlname(File._meta, 'expand'), args=(file.pk,)),
+        )
 
 
 class FilerClipboardAdminUrlsTests(TestCase):
@@ -225,20 +615,71 @@ class FilerClipboardAdminUrlsTests(TestCase):
         os.remove(self.video_filename)
         super().tearDown()
 
+    def test_filer_ajax_upload_malformed_request(self):
+        """
+        A request the upload handlers cannot parse is answered with 400 and a
+        generic message: the exception text describes an internal protocol
+        violation and must not be echoed back to the client.
+        """
+        from filer.admin.clipboardadmin import UPLOAD_ERROR
+
+        url = reverse('admin:filer-ajax_upload')
+        with self.assertLogs('filer.admin.clipboardadmin', level='WARNING') as logs:
+            response = self.client.post(url, data={})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.content.decode('utf-8')),
+            {'error': str(UPLOAD_ERROR)},
+        )
+        # The internal reason is logged, not returned
+        self.assertNotIn('Bad Upload', response.content.decode('utf-8'))
+        self.assertIn('Bad Upload', '\n'.join(logs.output))
+        self.assertEqual(File.objects.count(), 0)
+
     def test_filer_upload_file(self, extra_headers={}):
         self.assertEqual(Image.objects.count(), 0)
         folder = Folder.objects.create(name='foo')
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
-        url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
-        post_data = {
-            'Filename': self.image_name,
-            'Filedata': file_obj,
-            'jsessionid': self.client.session.session_key
-        }
-        response = self.client.post(url, post_data, **extra_headers)  # noqa
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
+            post_data = {
+                'Filename': self.image_name,
+                'Filedata': file_obj,
+                'jsessionid': self.client.session.session_key
+            }
+            self.client.post(url, post_data, **extra_headers)
+
         self.assertEqual(Image.objects.count(), 1)
         self.assertEqual(Image.objects.all()[0].original_filename,
                          self.image_name)
+
+    def test_filer_upload_response(self):
+        """The upload response carries what the file widget needs to show the new file"""
+        folder = Folder.objects.create(name='foo')
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
+            response = self.client.post(url, {
+                'Filename': self.image_name,
+                'Filedata': file_obj,
+                'jsessionid': self.client.session.session_key,
+            })
+
+        image = Image.objects.get()
+        self.assertEqual(
+            json.loads(response.content.decode('utf-8')),
+            {
+                'thumbnail': None,
+                'alt_text': '',
+                'label': str(image),
+                'file_id': image.pk,
+                'change_url': image.get_admin_change_url(),
+                'thumbnail_180': reverse('admin:filer_image_fileicon',
+                                         args=(image.pk, FILER_THUMBNAIL_ICON_SIZE)),
+                'original_image': image.url,
+            },
+        )
 
     def test_filer_upload_video(self, extra_headers={}):
         with SettingsOverride(filer_settings, FILER_FILE_MODELS=(
@@ -249,14 +690,16 @@ class FilerClipboardAdminUrlsTests(TestCase):
         )):
             self.assertEqual(Video.objects.count(), 0)
             folder = Folder.objects.create(name='foo')
-            file_obj = django.core.files.File(open(self.video_filename, 'rb'))
-            url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
-            post_data = {
-                'Filename': self.video_name,
-                'Filedata': file_obj,
-                'jsessionid': self.client.session.session_key
-            }
-            response = self.client.post(url, post_data, **extra_headers)  # noqa
+            with open(self.video_filename, 'rb') as fh:
+                file_obj = django.core.files.File(fh)
+                url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
+                post_data = {
+                    'Filename': self.video_name,
+                    'Filedata': file_obj,
+                    'jsessionid': self.client.session.session_key
+                }
+                self.client.post(url, post_data, **extra_headers)
+
             self.assertEqual(Video.objects.count(), 1)
             self.assertEqual(Video.objects.all()[0].original_filename, self.video_name)
 
@@ -269,81 +712,240 @@ class FilerClipboardAdminUrlsTests(TestCase):
         )):
             self.assertEqual(ExtImage.objects.count(), 0)
             folder = Folder.objects.create(name='foo')
-            file_obj = django.core.files.File(open(self.filename, 'rb'))
-            url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
+            with open(self.filename, 'rb') as fh:
+                file_obj = django.core.files.File(fh)
+                url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
+                post_data = {
+                    'Filename': self.image_name,
+                    'Filedata': file_obj,
+                    'jsessionid': self.client.session.session_key
+                }
+                self.client.post(url, post_data, **extra_headers)
+
+            self.assertEqual(ExtImage.objects.count(), 1)
+            self.assertEqual(ExtImage.objects.all()[0].original_filename, self.image_name)
+
+    def test_filer_upload_file_no_folder(self, extra_headers={}):
+        self.assertEqual(Image.objects.count(), 0)
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse('admin:filer-ajax_upload')
             post_data = {
                 'Filename': self.image_name,
                 'Filedata': file_obj,
                 'jsessionid': self.client.session.session_key
             }
             response = self.client.post(url, post_data, **extra_headers)  # noqa
-            self.assertEqual(ExtImage.objects.count(), 1)
-            self.assertEqual(ExtImage.objects.all()[0].original_filename, self.image_name)
-
-    def test_filer_upload_file_no_folder(self, extra_headers={}):
-        self.assertEqual(Image.objects.count(), 0)
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
-        url = reverse('admin:filer-ajax_upload')
-        post_data = {
-            'Filename': self.image_name,
-            'Filedata': file_obj,
-            'jsessionid': self.client.session.session_key
-        }
-        response = self.client.post(url, post_data, **extra_headers)  # noqa
-        self.assertEqual(Image.objects.count(), 1)
-        stored_image = Image.objects.first()
-        self.assertEqual(stored_image.original_filename, self.image_name)
-        self.assertEqual(stored_image.mime_type, 'image/jpeg')
+            self.assertEqual(Image.objects.count(), 1)
+            stored_image = Image.objects.first()
+            self.assertEqual(stored_image.original_filename, self.image_name)
+            self.assertEqual(stored_image.mime_type, 'image/jpeg')
 
     def test_filer_upload_binary_data(self, extra_headers={}):
+        config = apps.get_app_config("filer")
+
+        validators = config.FILE_VALIDATORS  # Remember the validators
+        config.FILE_VALIDATORS = {}  # Remove deny for application/octet-stream
         self.assertEqual(File.objects.count(), 0)
-        file_obj = django.core.files.File(open(self.binary_filename, 'rb'))
-        url = reverse('admin:filer-ajax_upload')
-        post_data = {
-            'Filename': self.binary_name,
-            'Filedata': file_obj,
-            'jsessionid': self.client.session.session_key
-        }
-        response = self.client.post(url, post_data, **extra_headers)  # noqa
-        self.assertEqual(Image.objects.count(), 0)
-        self.assertEqual(File.objects.count(), 1)
-        stored_file = File.objects.first()
-        self.assertEqual(stored_file.original_filename, self.binary_name)
-        self.assertEqual(stored_file.mime_type, 'application/octet-stream')
+        with open(self.binary_filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse('admin:filer-ajax_upload')
+            post_data = {
+                'Filename': self.binary_name,
+                'Filedata': file_obj,
+                'jsessionid': self.client.session.session_key
+            }
+            self.client.post(url, post_data, **extra_headers)
+            config.FILE_VALIDATORS = validators  # Reset validators
+
+            self.assertEqual(Image.objects.count(), 0)
+            self.assertEqual(File.objects.count(), 1)
+            stored_file = File.objects.first()
+            self.assertEqual(stored_file.original_filename, self.binary_name)
+            self.assertEqual(stored_file.mime_type, 'application/octet-stream')
+
+    def test_filer_upload_binary_data_fails_by_default(self, extra_headers={}):
+        self.assertEqual(File.objects.count(), 0)
+        with open(self.binary_filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse('admin:filer-ajax_upload')
+            post_data = {
+                'Filename': self.binary_name,
+                'Filedata': file_obj,
+                'jsessionid': self.client.session.session_key
+            }
+            self.client.post(url, post_data, **extra_headers)
+
+            self.assertEqual(Image.objects.count(), 0)
+            self.assertEqual(File.objects.count(), 0)
 
     def test_filer_ajax_upload_file(self):
         self.assertEqual(Image.objects.count(), 0)
         folder = Folder.objects.create(name='foo')
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
-        url = reverse(
-            'admin:filer-ajax_upload',
-            kwargs={'folder_id': folder.pk}
-        ) + '?filename=%s' % self.image_name
-        response = self.client.post(  # noqa
-            url,
-            data=file_obj.read(),
-            content_type='image/jpeg',
-            **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
-        )
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse(
+                'admin:filer-ajax_upload',
+                kwargs={'folder_id': folder.pk}
+            ) + '?filename=%s' % self.image_name
+            response = self.client.post(  # noqa
+                url,
+                data=file_obj.read(),
+                content_type='image/jpeg',
+                **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+            )
         self.assertEqual(Image.objects.count(), 1)
         stored_image = Image.objects.first()
         self.assertEqual(stored_image.original_filename, self.image_name)
         self.assertEqual(stored_image.mime_type, 'image/jpeg')
 
+    @unittest.skipUnless(
+        ".avif" in PILImage.registered_extensions(),
+        "Pillow does not support AVIF",
+    )
+    def test_filer_ajax_upload_avif_file(self):
+        """AVIF uploads are recognized as images (and thumbnailed) if Pillow can
+        decode them, see https://github.com/django-cms/django-filer/issues/1560"""
+        self.assertEqual(Image.objects.count(), 0)
+        folder = Folder.objects.create(name='foo')
+        avif_name = 'test_file.avif'
+        avif_filename = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, avif_name)
+        self.img.save(avif_filename, 'AVIF')
+        try:
+            with open(avif_filename, 'rb') as fh:
+                url = reverse(
+                    'admin:filer-ajax_upload',
+                    kwargs={'folder_id': folder.pk}
+                ) + '?filename=%s' % avif_name
+                self.client.post(
+                    url,
+                    data=fh.read(),
+                    content_type='image/avif',
+                    **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+                )
+        finally:
+            os.remove(avif_filename)
+
+        self.assertEqual(Image.objects.count(), 1)
+        stored_image = Image.objects.first()
+        self.assertEqual(stored_image.original_filename, avif_name)
+        self.assertEqual(stored_image.mime_type, 'image/avif')
+        self.assertEqual((stored_image.width, stored_image.height), self.img.size)
+        # Thumbnails are generated from the avif original
+        self.assertTrue(stored_image.icons)
+
+    def test_filer_ajax_decompression_bomb(self):
+        DEFAULT_MAX_IMAGE_PIXELS = abstract.FILER_MAX_IMAGE_PIXELS
+        try:
+            abstract.FILER_MAX_IMAGE_PIXELS = 800 * 200  # Triggers error
+            self.assertEqual(Image.objects.count(), 0)
+            folder = Folder.objects.create(name='foo')
+            with open(self.filename, 'rb') as fh:
+                file_obj = django.core.files.File(fh)
+                url = reverse(
+                    'admin:filer-ajax_upload',
+                    kwargs={'folder_id': folder.pk}
+                ) + '?filename=%s' % self.image_name
+                response = self.client.post(
+                    url,
+                    data=file_obj.read(),
+                    content_type='image/jpeg',
+                    **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+                )
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(Image.objects.count(), 0)
+            self.assertIn("error", json.loads(response.content.decode("utf-8")))
+            messages = list(get_messages(response.wsgi_request))
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0].level, ERROR)
+
+            abstract.FILER_MAX_IMAGE_PIXELS = 800 * 300  # Triggers warning
+            folder = Folder.objects.create(name='warning')
+            with open(self.filename, 'rb') as fh:
+                file_obj = django.core.files.File(fh)
+                url = reverse(
+                    'admin:filer-ajax_upload',
+                    kwargs={'folder_id': folder.pk}
+                ) + '?filename=%s' % self.image_name
+                response = self.client.post(
+                    url,
+                    data=file_obj.read(),
+                    content_type='image/jpeg',
+                    **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+                )
+            self.assertEqual(response.status_code, 400)
+            messages = list(get_messages(response.wsgi_request))
+            self.assertEqual(len(messages), 2)  # One more message
+            self.assertEqual(messages[1].level, ERROR)
+            self.assertEqual(Image.objects.count(), 0)
+        finally:
+            # Restore in a finally: FILER_MAX_IMAGE_PIXELS is a module global, so a
+            # failing assertion would otherwise leak it into every later test.
+            abstract.FILER_MAX_IMAGE_PIXELS = DEFAULT_MAX_IMAGE_PIXELS
+
+    def test_filer_upload_error_message_only_for_uploaders_without_inline_errors(self):
+        """filer's own uploaders show errors themselves; a session message would repeat
+        the error after the listing reloads"""
+        folder = Folder.objects.create(name='foo')
+        url = reverse('admin:filer-ajax_upload', kwargs={'folder_id': folder.pk})
+        empty_file = SimpleUploadedFile('empty.html', b'', content_type='text/html')
+
+        response = self.client.post(url, {'file': empty_file}, HTTP_X_FILER_INLINE_ERRORS='1')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('empty', json.loads(response.content.decode('utf-8'))['error'])
+        self.assertEqual(list(get_messages(response.wsgi_request)), [])
+
+        empty_file = SimpleUploadedFile('empty.html', b'', content_type='text/html')
+        response = self.client.post(url, {'file': empty_file})
+
+        self.assertEqual(response.status_code, 400)
+        messages = list(get_messages(response.wsgi_request))
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].level, ERROR)
+
+    def test_filer_max_pixel_deactivation(self):
+        from django.core.checks import Warning
+
+        DEFAULT_MAX_IMAGE_PIXELS = abstract.FILER_MAX_IMAGE_PIXELS
+        abstract.FILER_MAX_IMAGE_PIXELS = None  # Deactivate
+
+        self.assertEqual(Image.objects.count(), 0)
+        folder = Folder.objects.create(name='foo')
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse(
+                'admin:filer-ajax_upload',
+                kwargs={'folder_id': folder.pk}
+            ) + '?filename=%s' % self.image_name
+            self.client.post(
+                url,
+                data=file_obj.read(),
+                content_type='image/jpeg',
+                **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+            )
+        self.assertEqual(Image.objects.count(), 1)  # Success
+        check_result = abstract.max_pixel_setting_check(None)
+        self.assertEqual(len(check_result), 1)
+        self.assertIsInstance(check_result[0], Warning)
+
+        abstract.FILER_MAX_IMAGE_PIXELS = DEFAULT_MAX_IMAGE_PIXELS
+
     def test_filer_ajax_upload_file_using_content_type(self):
         self.assertEqual(Image.objects.count(), 0)
         folder = Folder.objects.create(name='foo')
-        file_obj = django.core.files.File(open(self.binary_filename, 'rb'))
-        url = reverse(
-            'admin:filer-ajax_upload',
-            kwargs={'folder_id': folder.pk}
-        ) + '?filename=renamed.pdf'
-        response = self.client.post(  # noqa
-            url,
-            data=file_obj.read(),
-            content_type='application/pdf',
-            **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
-        )
+        with open(self.binary_filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse(
+                'admin:filer-ajax_upload',
+                kwargs={'folder_id': folder.pk}
+            ) + '?filename=renamed.pdf'
+            self.client.post(
+                url,
+                data=file_obj.read(),
+                content_type='application/pdf',
+                **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+            )
         self.assertEqual(Image.objects.count(), 0)
         self.assertEqual(File.objects.count(), 1)
         stored_file = File.objects.first()
@@ -352,16 +954,17 @@ class FilerClipboardAdminUrlsTests(TestCase):
 
     def test_filer_ajax_upload_file_no_folder(self):
         self.assertEqual(Image.objects.count(), 0)
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
-        url = reverse(
-            'admin:filer-ajax_upload'
-        ) + '?filename=%s' % self.image_name
-        response = self.client.post(  # noqa
-            url,
-            data=file_obj.read(),
-            content_type='image/jpeg',
-            **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
-        )
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse(
+                'admin:filer-ajax_upload'
+            ) + '?filename=%s' % self.image_name
+            self.client.post(
+                url,
+                data=file_obj.read(),
+                content_type='image/jpeg',
+                **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+            )
         self.assertEqual(Image.objects.count(), 1)
         stored_image = Image.objects.first()
         self.assertEqual(stored_image.original_filename, self.image_name)
@@ -370,36 +973,38 @@ class FilerClipboardAdminUrlsTests(TestCase):
     def test_filer_upload_file_error(self, extra_headers={}):
         self.assertEqual(Image.objects.count(), 0)
         folder = Folder.objects.create(name='foo')
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
-        url = reverse('admin:filer-ajax_upload',
-                      kwargs={'folder_id': folder.pk + 1})
-        post_data = {
-            'Filename': self.image_name,
-            'Filedata': file_obj,
-            'jsessionid': self.client.session.session_key
-        }
-        response = self.client.post(url, post_data, **extra_headers)
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse('admin:filer-ajax_upload',
+                          kwargs={'folder_id': folder.pk + 1})
+            post_data = {
+                'Filename': self.image_name,
+                'Filedata': file_obj,
+                'jsessionid': self.client.session.session_key
+            }
+            response = self.client.post(url, post_data, **extra_headers)
         from filer.admin.clipboardadmin import NO_FOLDER_ERROR
-        self.assertContains(response, NO_FOLDER_ERROR)
+        self.assertContains(response, NO_FOLDER_ERROR, status_code=400)
         self.assertEqual(Image.objects.count(), 0)
 
     def test_filer_ajax_upload_file_error(self):
         self.assertEqual(Image.objects.count(), 0)
         folder = Folder.objects.create(name='foo')
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
-        url = reverse(
-            'admin:filer-ajax_upload',
-            kwargs={
-                'folder_id': folder.pk + 1}
-        ) + '?filename={0}'.format(self.image_name)
-        response = self.client.post(
-            url,
-            data=file_obj.read(),
-            content_type='application/octet-stream',
-            **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
-        )
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+            url = reverse(
+                'admin:filer-ajax_upload',
+                kwargs={
+                    'folder_id': folder.pk + 1}
+            ) + f'?filename={self.image_name}'
+            response = self.client.post(
+                url,
+                data=file_obj.read(),
+                content_type='application/octet-stream',
+                **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+            )
         from filer.admin.clipboardadmin import NO_FOLDER_ERROR
-        self.assertContains(response, NO_FOLDER_ERROR)
+        self.assertContains(response, NO_FOLDER_ERROR, status_code=400)
         self.assertEqual(Image.objects.count(), 0)
 
     def test_filer_upload_permissions_error(self, extra_headers={}):
@@ -408,35 +1013,38 @@ class FilerClipboardAdminUrlsTests(TestCase):
             username='joe_new', password='x', email='joe@mata.com')
         staff_user.is_staff = True
         staff_user.save()
+        staff_user.user_permissions.add(*Permission.objects.filter(codename="add_file"))
         self.client.login(username='joe_new', password='x')
         self.assertEqual(Image.objects.count(), 0)
         folder = Folder.objects.create(name='foo')
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
 
-        with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
+            with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
 
-            # give permissions over BAR
-            FolderPermission.objects.create(
-                folder=folder,
-                user=staff_user,
-                type=FolderPermission.THIS,
-                can_edit=FolderPermission.DENY,
-                can_read=FolderPermission.ALLOW,
-                can_add_children=FolderPermission.DENY)
-            url = reverse('admin:filer-ajax_upload',
-                          kwargs={'folder_id': folder.pk})
-            post_data = {
-                'Filename': self.image_name,
-                'Filedata': file_obj,
-                'jsessionid': self.client.session.session_key
-            }
-            response = self.client.post(url, post_data, **extra_headers)
+                # give permissions over BAR
+                FolderPermission.objects.create(
+                    folder=folder,
+                    user=staff_user,
+                    type=FolderPermission.THIS,
+                    can_edit=FolderPermission.DENY,
+                    can_read=FolderPermission.ALLOW,
+                    can_add_children=FolderPermission.DENY)
+                url = reverse('admin:filer-ajax_upload',
+                              kwargs={'folder_id': folder.pk})
+                post_data = {
+                    'Filename': self.image_name,
+                    'Filedata': file_obj,
+                    'jsessionid': self.client.session.session_key
+                }
+                response = self.client.post(url, post_data, **extra_headers)
 
         from filer.admin.clipboardadmin import NO_PERMISSIONS_FOR_FOLDER
-        self.assertContains(response, NO_PERMISSIONS_FOR_FOLDER)
+        self.assertContains(response, NO_PERMISSIONS_FOR_FOLDER, status_code=403)
         self.assertEqual(Image.objects.count(), 0)
 
-    def test_filer_ajax_upload_permissions_error(self, extra_headers={}):
+    def test_filer_ajax_upload_without_permissions_error(self, extra_headers={}):
+        """User without add_file permission cannot upload"""
         self.client.logout()
         staff_user = User.objects.create_user(
             username='joe_new', password='x', email='joe@mata.com')
@@ -445,32 +1053,117 @@ class FilerClipboardAdminUrlsTests(TestCase):
         self.client.login(username='joe_new', password='x')
         self.assertEqual(Image.objects.count(), 0)
         folder = Folder.objects.create(name='foo')
-        file_obj = django.core.files.File(open(self.filename, 'rb'))
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
 
-        with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
-
-            # give permissions over BAR
-            FolderPermission.objects.create(
-                folder=folder,
-                user=staff_user,
-                type=FolderPermission.THIS,
-                can_edit=FolderPermission.DENY,
-                can_read=FolderPermission.ALLOW,
-                can_add_children=FolderPermission.DENY)
             url = reverse(
                 'admin:filer-ajax_upload',
                 kwargs={
                     'folder_id': folder.pk}
-            ) + '?filename={0}'.format(self.image_name)
+            ) + f'?filename={self.image_name}'
             response = self.client.post(
                 url,
                 data=file_obj.read(),
                 content_type='application/octet-stream',
                 **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
             )
-        from filer.admin.clipboardadmin import NO_PERMISSIONS_FOR_FOLDER
-        self.assertContains(response, NO_PERMISSIONS_FOR_FOLDER)
+
+        from filer.admin.clipboardadmin import NO_PERMISSIONS
+
+        self.assertContains(response, NO_PERMISSIONS, status_code=403)
         self.assertEqual(Image.objects.count(), 0)
+
+    def test_filer_add_file_permissions(self, extra_headers={}):
+        """Add_file permissions reflect in has_... methods of File and Folder classes"""
+        self.client.logout()
+        staff_user = User.objects.create_user(
+            username='joe_new', password='x', email='joe@mata.com')
+        staff_user.is_staff = True
+        staff_user.save()
+        self.client.login(username='joe_new', password='x')
+        self.assertEqual(Image.objects.count(), 0)
+        folder = Folder.objects.create(name='foo')
+
+        file_data = django.core.files.base.ContentFile('some data')
+        file_data.name = self.filename
+        file = File.objects.create(
+            owner=self.superuser,
+            original_filename=self.filename,
+            file=file_data,
+            folder=folder
+        )
+        file.save()
+        request = HttpRequest()
+        request.user = staff_user
+
+        self.assertEqual(folder.has_add_children_permission(request), False)
+        self.assertEqual(file.has_add_children_permission(request), False)
+
+    def test_filer_ajax_upload_permissions_error(self, extra_headers={}):
+        self.client.logout()
+        staff_user = User.objects.create_user(
+            username='joe_new', password='x', email='joe@mata.com')
+        staff_user.is_staff = True
+        staff_user.save()
+        staff_user.user_permissions.add(*Permission.objects.filter(codename="add_file"))
+        self.client.login(username='joe_new', password='x')
+        self.assertEqual(Image.objects.count(), 0)
+        folder = Folder.objects.create(name='foo')
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh)
+
+            with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
+
+                # give permissions over BAR
+                FolderPermission.objects.create(
+                    folder=folder,
+                    user=staff_user,
+                    type=FolderPermission.THIS,
+                    can_edit=FolderPermission.DENY,
+                    can_read=FolderPermission.ALLOW,
+                    can_add_children=FolderPermission.DENY)
+                url = reverse(
+                    'admin:filer-ajax_upload',
+                    kwargs={
+                        'folder_id': folder.pk}
+                ) + f'?filename={self.image_name}'
+                response = self.client.post(
+                    url,
+                    data=file_obj.read(),
+                    content_type='application/octet-stream',
+                    **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
+                )
+
+        from filer.admin.clipboardadmin import NO_PERMISSIONS_FOR_FOLDER
+        self.assertContains(response, NO_PERMISSIONS_FOR_FOLDER, status_code=403)
+        self.assertEqual(Image.objects.count(), 0)
+
+    def test_templatetag_file_icon_url(self):
+        filename = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, 'invalid.svg')
+        with open(filename, 'wb') as fh:
+            fh.write(b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" height="0" width="0"><circle cx="0" cy="0" r="0" stroke="black" stroke-width="3" fill="red" /></svg>')
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh, name=filename)
+            image_obj = Image.objects.create(owner=self.superuser, original_filename=self.image_name, file=file_obj, mime_type='image/svg+xml')
+            image_obj.save()
+        url = file_icon_url(image_obj)
+        self.assertEqual(url, '/static/filer/icons/file-unknown.svg')
+
+    def test_templatetag_file_icon_url_is_html_escaped_only(self):
+        # The URL ends up in a data attribute read via ``dataset``, so it must be
+        # HTML-escaped, not JS-escaped (#1645)
+        file_obj = File.objects.create(name='test.pdf')
+        icon_url = 'https://cdn.example-test.de/a1621890-6d4b.svg?a=1&b="2"'
+        template = Template('{% load filer_admin_tags %}<img data-icon-url="{% file_icon_url file %}">')
+        with unittest.mock.patch(
+            'filer.templatetags.filer_admin_tags.file_icon_context',
+            return_value={'icon_url': icon_url},
+        ):
+            html = template.render(Context({'file': file_obj}))
+        self.assertEqual(
+            html,
+            '<img data-icon-url="https://cdn.example-test.de/a1621890-6d4b.svg?a=1&amp;b=&quot;2&quot;">',
+        )
 
 
 class BulkOperationsMixin:
@@ -512,9 +1205,10 @@ class BulkOperationsMixin:
 
     def create_image(self, folder, filename=None):
         filename = filename or 'test_image.jpg'
-        file_obj = django.core.files.File(open(self.filename, 'rb'), name=filename)
-        image_obj = Image.objects.create(owner=self.superuser, original_filename=self.image_name, file=file_obj, folder=folder, mime_type='image/jpeg')
-        image_obj.save()
+        with open(self.filename, 'rb') as fh:
+            file_obj = django.core.files.File(fh, name=filename)
+            image_obj = Image.objects.create(owner=self.superuser, original_filename=self.image_name, file=file_obj, folder=folder, mime_type='image/jpeg')
+            image_obj.save()
         return image_obj
 
     def create_file(self, folder, filename=None):
@@ -526,6 +1220,94 @@ class BulkOperationsMixin:
         return file_obj
 
 
+class FolderAndFileSortingMixin(BulkOperationsMixin):
+    def setUp(self):
+        self.superuser = create_superuser()
+        self.client.login(username='admin', password='secret')
+        self.img = create_image()
+        self.folder_1 = Folder(name='Pictures', parent=None)
+        self.folder_1.save()
+        self.nested_folder_2 = Folder(name='Nested 2', parent=self.folder_1)
+        self.nested_folder_1 = Folder(name='Nested 1', parent=self.folder_1)
+        self.nested_folder_1.save()
+        self.nested_folder_2.save()
+        self.create_file(folder=self.folder_1, filename='background.jpg')
+        self.create_file(folder=self.folder_1, filename='A_Testfile.jpg')
+        self.create_file(folder=self.folder_1, filename='Another_Test.jpg')
+        newspaper_file = self.create_file(folder=self.folder_1, filename='Newspaper.pdf')
+        newspaper_file.name = 'Zeitung'
+        newspaper_file.save()
+        renamed_file = self.create_file(folder=self.folder_1, filename='last_when_sorting_by_filename.jpg')
+        renamed_file.name = 'A cute dog'
+        renamed_file.save()
+
+    def tearDown(self):
+        self.client.logout()
+        for f in File.objects.all():
+            f.delete()
+        for folder in Folder.objects.all():
+            folder.delete()
+
+
+class FilerFolderAndFileSortingTests(FolderAndFileSortingMixin, TestCase):
+    # Assert that the folders are correctly sorted
+    def test_filer_folder_sorting(self):
+        response = self.client.get(reverse('admin:filer-directory_listing', kwargs={
+            'folder_id': self.folder_1.pk
+        }))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context['folder_children'].count(), 2)
+        self.assertEqual(response.context['folder_children'][0].name, 'Nested 1')
+        self.assertEqual(response.context['folder_children'][1].name, 'Nested 2')
+
+    # Default sorting should be alphabetically
+    def test_filer_directory_listing_default_sorting(self):
+        response = self.client.get(reverse('admin:filer-directory_listing', kwargs={
+            'folder_id': self.folder_1.pk
+        }))
+        self.assertEqual(response.status_code, 200)
+        # when using the default sort, the folder_files are of type `list`,
+        # so we assert the length.
+        self.assertEqual(len(response.context['folder_files']), 5)
+
+        expected_filenames = ['A cute dog', 'A_Testfile.jpg', 'Another_Test.jpg', 'background.jpg', 'Zeitung']
+        for index, expected_filename in enumerate(expected_filenames):
+            self.assertEqual(str(response.context['folder_files'][index]), expected_filename)
+
+    # Now, all columns with empty name should be alphabetically sorted by their filename,
+    # after that, at the end of the list, all files with and explicit name should appear;
+    # however, since we ONLY sort by name, the order of items without name is not defined
+    # by their filename but rather by their creation date.
+    # So, the order is expected to be ordered as they are created in the setUp method.
+    def test_filer_directory_listing_sorting_with_order_by_param(self):
+        response = self.client.get(reverse('admin:filer-directory_listing', kwargs={
+            'folder_id': self.folder_1.pk
+        }), {'order_by': 'name'})
+        self.assertEqual(response.status_code, 200)
+        # when using the default sort, the folder_files are of type `list`,
+        # so we assert the length.
+        self.assertEqual(len(response.context['folder_files']), 5)
+
+        expected_filenames = ['background.jpg', 'A_Testfile.jpg', 'Another_Test.jpg', 'A cute dog', 'Zeitung']
+        for index, expected_filename in enumerate(expected_filenames):
+            self.assertEqual(str(response.context['folder_files'][index]), expected_filename)
+
+    # Finally, we can define a fallback column to pass into `order_by` so that files without
+    # any name are still sorted by something (in this case, their original_filename).
+    # This should yield the expected order as well, but NOT the exact same order as the default sorting,
+    # since we sort by name FIRST and all items with the same value again by original_filename.
+    def test_filer_directory_listing_sorting_with_multiple_order_by_params(self):
+        response = self.client.get(reverse('admin:filer-directory_listing', kwargs={
+            'folder_id': self.folder_1.pk
+        }), {'order_by': 'name,original_filename'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context['folder_files']), 5)
+
+        expected_filenames = ['A_Testfile.jpg', 'Another_Test.jpg', 'background.jpg', 'A cute dog', 'Zeitung']
+        for index, expected_filename in enumerate(expected_filenames):
+            self.assertEqual(str(response.context['folder_files'][index]), expected_filename)
+
+
 class FilerBulkOperationsTests(BulkOperationsMixin, TestCase):
     def test_move_files_and_folders_action(self):
         # TODO: Test recursive (files and folders tree) move
@@ -535,7 +1317,7 @@ class FilerBulkOperationsTests(BulkOperationsMixin, TestCase):
         url = reverse('admin:filer-directory_listing', kwargs={
             'folder_id': self.src_folder.id,
         })
-        response = self.client.post(url, {  # noqa
+        response = self.client.post(url, {
             'action': 'move_files_and_folders',
             'post': 'yes',
             'destination': self.dst_folder.id,
@@ -564,7 +1346,7 @@ class FilerBulkOperationsTests(BulkOperationsMixin, TestCase):
           |
           |--bar
 
-        and try to move the owter bar in foo. This has to fail since it would result
+        and try to move the outer bar in foo. This has to fail since it would result
         in two folders with the same name and parent.
         """
         root = Folder.objects.create(name='root', owner=self.superuser)
@@ -674,20 +1456,44 @@ class FilerBulkOperationsTests(BulkOperationsMixin, TestCase):
         dst_image_obj = self.dst_folder.files[0]
         self.assertEqual(dst_image_obj.original_filename, 'test_filetest.jpg')
 
+    def test_copy_folder_action(self):
+        self.assertEqual(self.src_folder.files.count(), 1)
+        self.assertEqual(self.dst_folder.files.count(), 0)
+        self.assertEqual(self.dst_folder.children.count(), 0)
+        self.assertEqual(self.image_obj.original_filename, 'test_file.jpg')
+        url = reverse('admin:filer-directory_listing-root')
+        response = self.client.post(url, {
+            'action': 'copy_files_and_folders',
+            'post': 'yes',
+            'suffix': 'test',
+            'destination': self.dst_folder.id,
+            helpers.ACTION_CHECKBOX_NAME: 'folder-%d' % (self.src_folder.id,),
+        })
+        self.assertEqual(response.status_code, 302)
+
+        self.assertEqual(self.src_folder.files.count(), 1)
+        self.assertEqual(self.dst_folder.files.count(), 0)
+        self.assertEqual(self.dst_folder.children.count(), 1)
+        copied_dir = self.dst_folder.children.first()
+        dst_image_obj = copied_dir.files[0]
+        self.assertEqual(copied_dir.name, self.src_folder.name)
+        self.assertEqual(copied_dir.files.count(), 1)
+        self.assertEqual(dst_image_obj.original_filename, 'test_filetest.jpg')
+
     def _do_test_rename(self, url, new_name, file_obj=None, folder_obj=None):
         """
         Helper to submit rename form and check renaming result.
         'new_name' should be a plain string, no formatting supported.
         """
         if file_obj is not None:
-            checkbox_name = 'file-{}'.format(file_obj.id)
+            checkbox_name = f'file-{file_obj.id}'
             files = [file_obj]
         elif folder_obj is not None:
-            checkbox_name = 'folder-{}'.format(folder_obj.id)
+            checkbox_name = f'folder-{folder_obj.id}'
             # files inside this folder, non-recursive
             files = File.objects.filter(folder=folder_obj)
         else:
-            raise(ValueError('file_obj or folder_obj is required'))
+            raise ValueError('file_obj or folder_obj is required')
 
         response = self.client.post(url, {
             'action': 'rename_files',
@@ -770,6 +1576,21 @@ class FilerDeleteOperationTests(BulkOperationsMixin, TestCase):
             helpers.ACTION_CHECKBOX_NAME: folders,
         })
         self.assertEqual(File.objects.filter(folder__in=[self.folder.id, self.sub_folder1.id]).count(), 0)
+
+    def test_delete_folders_action_logs_folders(self):
+        url = reverse('admin:filer-directory_listing', args=(self.folder.id,))
+        self.client.post(url, {
+            'action': 'delete_files_or_folders',
+            'post': 'yes',
+            helpers.ACTION_CHECKBOX_NAME: ['folder-%d' % self.sub_folder1.id],
+        })
+
+        # Selected folders must be logged, not only their files.
+        self.assertTrue(LogEntry.objects.filter(
+            action_flag=DELETION,
+            content_type__model='folder',
+            object_id=str(self.sub_folder1.id),
+        ).exists())
 
 
 class FilerResizeOperationTests(BulkOperationsMixin, TestCase):
@@ -859,11 +1680,15 @@ class PermissionAdminTest(TestCase):
 class FolderListingTest(TestCase):
 
     def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
         superuser = create_superuser()
         self.staff_user = User.objects.create_user(
             username='joe', password='x', email='joe@mata.com')
         self.staff_user.is_staff = True
         self.staff_user.save()
+        perms = Permission.objects.filter(codename__in=["view_folder", "add_file", "add_folder", "can_use_directory_listing"])
+        self.staff_user.user_permissions.add(*perms)
         self.parent = Folder.objects.create(name='bar', parent=None, owner=superuser)
 
         self.foo_folder = Folder.objects.create(name='foo', parent=self.parent, owner=self.staff_user)
@@ -877,6 +1702,18 @@ class FolderListingTest(TestCase):
             file=file_data, folder=self.parent)
         self.client.login(username='joe', password='x')
 
+    def test_with_without_permissions(self):
+        staff_user_wo_permissions = User.objects.create_user(
+            username='joemata', password='x', email='joe@mata.com')
+        staff_user_wo_permissions.is_staff = True
+        staff_user_wo_permissions.save()
+        self.client.login(username='joemata', password='x')
+        with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=False):
+            response = self.client.get(
+                reverse('admin:filer-directory_listing',
+                        kwargs={'folder_id': self.parent.id}))
+        self.assertIsInstance(response, HttpResponseForbidden)
+
     def test_with_permissions_disabled(self):
         with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=False):
             response = self.client.get(
@@ -885,9 +1722,9 @@ class FolderListingTest(TestCase):
             item_list = response.context['paginated_items'].object_list
             # user sees all items: FOO, BAR, BAZ, SAMP
             self.assertEqual(
-                set(folder.pk for folder in item_list),
-                set([self.foo_folder.pk, self.bar_folder.pk, self.baz_folder.pk,
-                     self.spam_file.pk]))
+                {folder.pk for folder in item_list},
+                {self.foo_folder.pk, self.bar_folder.pk, self.baz_folder.pk, self.spam_file.pk}
+            )
 
     def test_folder_ownership(self):
         with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
@@ -899,8 +1736,8 @@ class FolderListingTest(TestCase):
             # he doesn't see BAR, BAZ and SPAM because he doesn't own them
             # and no permission has been given
             self.assertEqual(
-                set(folder.pk for folder in item_list),
-                set([self.foo_folder.pk]))
+                {folder.pk for folder in item_list},
+                {self.foo_folder.pk})
 
     def test_with_permission_given_to_folder(self):
         with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
@@ -918,8 +1755,8 @@ class FolderListingTest(TestCase):
             item_list = response.context['paginated_items'].object_list
             # user sees 2 folder : FOO, BAR
             self.assertEqual(
-                set(folder.pk for folder in item_list),
-                set([self.foo_folder.pk, self.bar_folder.pk]))
+                {folder.pk for folder in item_list},
+                {self.foo_folder.pk, self.bar_folder.pk})
 
     def test_with_permission_given_to_parent_folder(self):
         with SettingsOverride(filer_settings, FILER_ENABLE_PERMISSIONS=True):
@@ -930,15 +1767,17 @@ class FolderListingTest(TestCase):
                 can_edit=FolderPermission.ALLOW,
                 can_read=FolderPermission.ALLOW,
                 can_add_children=FolderPermission.ALLOW)
+            from filer.cache import clear_folder_permission_cache
+            clear_folder_permission_cache(self.staff_user)
             response = self.client.get(
                 reverse('admin:filer-directory_listing',
                         kwargs={'folder_id': self.parent.id}))
             item_list = response.context['paginated_items'].object_list
             # user sees all items because he has permissions on the parent folder
             self.assertEqual(
-                set(folder.pk for folder in item_list),
-                set([self.foo_folder.pk, self.bar_folder.pk, self.baz_folder.pk,
-                     self.spam_file.pk]))
+                {folder.pk for folder in item_list},
+                {self.foo_folder.pk, self.bar_folder.pk, self.baz_folder.pk, self.spam_file.pk}
+            )
 
     def test_search_against_owner(self):
         url = reverse('admin:filer-directory_listing',
@@ -979,7 +1818,7 @@ class FolderListingTest(TestCase):
 
         # Create a file with a problematic filename
         problematic_file = django.core.files.base.ContentFile('some data')
-        filename = u'christopher_eccleston'
+        filename = 'christopher_eccleston'
         problematic_file.name = filename
         self.spam_file = File.objects.create(
             owner=self.staff_user, original_filename=filename,
@@ -1252,6 +2091,30 @@ class FilerAdminContextTests(TestCase, BulkOperationsMixin):
             )
         )
 
+    def test_edit_from_widget_mode_save(self):
+        parent_folder = Folder.objects.create(name='parent')
+        image = self.create_image(folder=parent_folder)
+        base_url = image.get_admin_change_url()
+        edit_popup_url = base_url + '?_edit_from_widget=1&_popup=1'
+
+        response = self.client.get(edit_popup_url)
+        self.assertEqual(response.status_code, 200)
+        response.render()
+        self.assertContains(response,
+                            '<input type="hidden" name="_popup" value="1"')
+        self.assertContains(response,
+                            '<input type="hidden" name="_edit_from_widget" value="1"')
+
+        data = {'_popup': '1', '_edit_from_widget': '1'}
+        data.update(model_to_dict(image, all=True))
+        data = {k: v if v is not None else '' for k, v in data.items()}
+
+        response = self.client.post(edit_popup_url, data=data)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('media', response.context_data)
+        response.render()
+        self.assertContains(response, 'popup_response.js')
+
     def test_pick_mode_folder_save(self):
         folder = Folder.objects.create(name='foo')
         base_url = reverse('admin:filer_folder_change', args=[folder.id])
@@ -1372,3 +2235,177 @@ class PolymorphicDeleteViewTests(BulkOperationsMixin, TestCase):
             )
         )
         self.assertEqual(Folder.objects.filter(id=folder.id).count(), 0)
+
+
+class AdminToolsTests(TestCase):
+
+    def setUp(self):
+        self.superuser = create_superuser()
+        self.client.login(username='admin', password='secret')
+
+    def tearDown(self):
+        self.client.logout()
+
+    def test_admin_url_params(self):
+        request_factory = RequestFactory()
+        request = request_factory.get('/')
+        self.assertDictEqual(tools.admin_url_params(request), {})
+        request = request_factory.get('/', {'_popup': '1', '_pick': 'file', '_edit_from_widget': '1'})
+        self.assertDictEqual(tools.admin_url_params(request, {'extra_param': 42}), {
+            '_popup': '1',
+            '_pick': 'file',
+            '_edit_from_widget': '1',
+            'extra_param': 42,
+        })
+        request = request_factory.get('/', {'_pick': 'bad_type'})
+        self.assertDictEqual(tools.admin_url_params(request), {})
+
+
+class FileIconContextTests(TestCase):
+    def test_image_icon_with_size(self):
+        """
+        Image with get an aspect ratio and will be present in context
+        """
+        image = Image.objects.create(name='test.jpg')
+        image._width = 50
+        image._height = 200
+        image.save()
+        context = {}
+        height, width, context = get_aspect_ratio_and_download_url(context=context, detail=True, file=image, height=40, width=40)
+        self.assertIn('sidebar_image_ratio', context.keys())
+        self.assertIn('download_url', context.keys())
+
+    def test_file_icon_with_size(self):
+        """
+        File with not get an aspect ratio and will not be present in context
+        """
+        file = File.objects.create(name='test.pdf')
+        context = {}
+        height, width, context = get_aspect_ratio_and_download_url(context=context, detail=True, file=file, height=40, width=40)
+        self.assertNotIn('sidebar_image_ratio', context.keys())
+        self.assertIn('download_url', context.keys())
+
+    def test_sidebar_image_ratio_format(self):
+        """
+        Test that sidebar_image_ratio is formatted as a string with 6 decimal places
+        to ensure consistent formatting regardless of locale settings
+        """
+        image = Image.objects.create(name='test.jpg')
+        image._width = 100
+        image._height = 200
+        image.save()
+        context = {}
+        height, width, context = get_aspect_ratio_and_download_url(context=context, detail=True, file=image, height=40, width=40)
+        self.assertIsInstance(context['sidebar_image_ratio'], str)
+        expected_ratio = '%.6f' % (image.width / 210)
+        self.assertEqual(context['sidebar_image_ratio'], expected_ratio)
+        self.assertEqual(context['sidebar_image_ratio'], '0.476190')
+
+
+class AdditionalAdminFormsTests(TestCase):
+    def setUp(self):
+        self.superuser = create_superuser()
+        self.client.login(username='admin', password='secret')
+        self.img = create_image()
+        self.image_name = 'test_file.jpg'
+        self.filename = os.path.join(settings.FILE_UPLOAD_TEMP_DIR, self.image_name)
+        self.img.save(self.filename, 'JPEG')
+        with open(self.filename, 'rb') as upload:
+            self.file_object = Image.objects.create(file=django.core.files.File(upload, name=self.image_name))
+        self.payload = {
+            'select_across': ['0'], 'index': ['0'],
+            '_selected_action': [f'file-{self.file_object.pk}',]
+        }
+        self.url = reverse("admin:filer-directory_listing-unfiled_images")
+
+    def tearDown(self):
+        self.client.logout()
+        os.remove(self.filename)
+
+    def test_copy_form(self):
+        response = self.client.post(self.url, {"action": ["copy_files_and_folders"], **self.payload})
+        self.assertContains(response, '<p>There are no destination folders available.</p>')
+
+        folder = Folder.objects.create(name="My Image Folder")
+        response = self.client.post(self.url, {"action": ["copy_files_and_folders"], **self.payload})
+        self.assertContains(response, ' <option value="1">/My Image Folder</option>')
+
+        folder.delete()
+
+    def test_move_form(self):
+        response = self.client.post(self.url, {"action": ["move_files_and_folders"], **self.payload})
+        self.assertContains(response, '<p>There are no destination folders available.</p>')
+
+        folder = Folder.objects.create(name="My Image Folder")
+        response = self.client.post(self.url, {"action": ["copy_files_and_folders"], **self.payload})
+        self.assertContains(response, ' <option value="1">/My Image Folder</option>')
+
+        folder.delete()
+
+    def test_resize_form(self):
+        response = self.client.post(self.url, {"action": ["resize_images"], **self.payload})
+        self.assertContains(response, 'Warning: Images will be resized in-place and originals will be lost.')
+        if DJANGO_VERSION < (6, 1):
+            self.assertContains(response, '<div class="form-row field-crop field-upscale">')
+        else:
+            self.assertContains(
+                response,
+                '<div class="form-row flex-container form-multiline field-crop field-upscale">',
+            )
+
+
+class BreadcrumbsTests(TestCase):
+    """Filer's admin templates must emit the breadcrumb markup the running Django styles.
+
+    Django 6.1 replaced ``<div class="breadcrumbs">`` with ``<ol class="breadcrumbs">``
+    and its CSS selectors are element-qualified, so a ``<div>`` renders unstyled (#1615).
+    """
+
+    def setUp(self):
+        self.superuser = create_superuser()
+        self.client.login(username='admin', password='secret')
+        self.folder = Folder.objects.create(name="Breadcrumb Folder")
+
+    def tearDown(self):
+        self.client.logout()
+
+    def assertBreadcrumbs(self, response):
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode("utf-8")
+        if DJANGO_VERSION < (6, 1):
+            self.assertIn('<div class="breadcrumbs">', content)
+            self.assertNotIn('<ol class="breadcrumbs">', content)
+        else:
+            self.assertIn('<ol class="breadcrumbs">', content)
+            self.assertNotIn('<div class="breadcrumbs">', content)
+            # Django 6.1 generates the separators from ``li::after``; emitting
+            # them as well would show doubled chevrons.
+            breadcrumbs = content.split('<ol class="breadcrumbs">')[1].split('</ol>')[0]
+            self.assertNotIn('&rsaquo;', breadcrumbs)
+            self.assertIn('aria-current="page"', breadcrumbs)
+
+    def test_directory_listing_breadcrumbs(self):
+        response = self.client.get(reverse("admin:filer-directory_listing", args=[self.folder.pk]))
+        self.assertBreadcrumbs(response)
+
+    def test_folder_change_form_breadcrumbs(self):
+        response = self.client.get(reverse("admin:filer_folder_change", args=[self.folder.pk]))
+        self.assertBreadcrumbs(response)
+
+    def test_file_change_form_breadcrumbs(self):
+        file_object = File.objects.create(
+            original_filename="breadcrumb.txt",
+            file=django.core.files.base.ContentFile(b"content", name="breadcrumb.txt"),
+            folder=self.folder,
+        )
+        response = self.client.get(reverse("admin:filer_file_change", args=[file_object.pk]))
+        self.assertBreadcrumbs(response)
+
+    def test_delete_confirmation_breadcrumbs(self):
+        response = self.client.get(reverse("admin:filer_folder_delete", args=[self.folder.pk]))
+        self.assertBreadcrumbs(response)
+
+    def test_django_version_gte(self):
+        self.assertTrue(django_version_gte(*DJANGO_VERSION[:2]))
+        self.assertTrue(django_version_gte(DJANGO_VERSION[0] - 1))
+        self.assertFalse(django_version_gte(DJANGO_VERSION[0] + 1))

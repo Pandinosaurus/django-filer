@@ -2,8 +2,8 @@ import logging
 import os
 
 from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
-from django.core.files.storage import get_storage_class
+from django.utils.module_loading import import_string as get_storage_class
+from django.utils.translation import gettext_lazy as _
 
 from .utils.loader import load_object
 from .utils.recursive_dictionary import RecursiveDictionaryWithExcludes
@@ -35,22 +35,26 @@ FILER_ENABLE_PERMISSIONS = getattr(settings, 'FILER_ENABLE_PERMISSIONS', False)
 FILER_ALLOW_REGULAR_USERS_TO_ADD_ROOT_FOLDERS = getattr(settings, 'FILER_ALLOW_REGULAR_USERS_TO_ADD_ROOT_FOLDERS', False)
 FILER_IS_PUBLIC_DEFAULT = getattr(settings, 'FILER_IS_PUBLIC_DEFAULT', True)
 
-FILER_PAGINATE_BY = getattr(settings, 'FILER_PAGINATE_BY', 20)
+FILER_PAGINATE_BY = getattr(settings, 'FILER_PAGINATE_BY', 100)
+
+if hasattr(settings, "FILER_ADMIN_ICON_SIZES"):
+    logger.warning("FILER_ADMIN_ICON_SIZES is deprecated and will be removed in the future.")
 
 _ICON_SIZES = getattr(settings, 'FILER_ADMIN_ICON_SIZES', ('16', '32', '48', '64'))
-if not _ICON_SIZES:
-    raise ImproperlyConfigured('Please, configure FILER_ADMIN_ICON_SIZES')
 # Reliably sort by integer value, but keep icon size as string.
 # (There is some code in the wild that depends on this being strings.)
 FILER_ADMIN_ICON_SIZES = [str(i) for i in sorted([int(s) for s in _ICON_SIZES])]
 
-# Filer admin templates have specific icon sizes hardcoded: 32 and 48.
-_ESSENTIAL_ICON_SIZES = ('32', '48')
-if not all(x in FILER_ADMIN_ICON_SIZES for x in _ESSENTIAL_ICON_SIZES):
-    logger.warn(
-        "FILER_ADMIN_ICON_SIZES has not all of the essential icon sizes "
-        "listed: {}. Some icons might be missing in admin templates.".format(
-            _ESSENTIAL_ICON_SIZES))
+# Currently, these two icon sizes are hard-coded into the admin and admin templates
+FILER_TABLE_ICON_SIZE = getattr(settings, "FILER_TABLE_ICON_SIZE", 40)
+FILER_THUMBNAIL_ICON_SIZE = getattr(settings, "FILER_THUMBNAIL_ICON_SIZE", 120)
+DEFERRED_THUMBNAIL_SIZES = (
+    FILER_TABLE_ICON_SIZE,
+    2 * FILER_TABLE_ICON_SIZE,
+    FILER_THUMBNAIL_ICON_SIZE,
+    2 * FILER_THUMBNAIL_ICON_SIZE,
+)
+
 
 # This is an ordered iterable that describes a list of
 # classes that I should check for when adding files
@@ -58,7 +62,10 @@ FILER_FILE_MODELS = getattr(
     settings, 'FILER_FILE_MODELS',
     (FILER_IMAGE_MODEL, 'filer.File'))
 
-DEFAULT_FILE_STORAGE = getattr(settings, 'DEFAULT_FILE_STORAGE', 'django.core.files.storage.FileSystemStorage')
+if hasattr(settings, "STORAGES") and 'default' in settings.STORAGES:
+    DEFAULT_FILE_STORAGE = settings.STORAGES['default'].get('BACKEND', 'django.core.files.storage.FileSystemStorage')
+else:
+    DEFAULT_FILE_STORAGE = getattr(settings, 'DEFAULT_FILE_STORAGE', 'django.core.files.storage.FileSystemStorage')
 
 MINIMAL_FILER_STORAGES = {
     'public': {
@@ -246,7 +253,85 @@ else:
     _uploader_connections = 3
 FILER_UPLOADER_CONNECTIONS = getattr(
     settings, 'FILER_UPLOADER_CONNECTIONS', _uploader_connections)
+FILER_UPLOADER_MAX_FILES = getattr(
+    settings, 'FILER_UPLOADER_MAX_FILES', 100)
+FILER_UPLOADER_MAX_FILE_SIZE = getattr(
+    settings, 'FILER_UPLOADER_MAX_FILE_SIZE', None)
+
 
 FILER_DUMP_PAYLOAD = getattr(settings, 'FILER_DUMP_PAYLOAD', False)  # Whether the filer shall dump the files payload
 
 FILER_CANONICAL_URL = getattr(settings, 'FILER_CANONICAL_URL', 'canonical/')
+
+TABLE_LIST_TYPE = 'tb'
+THUMBNAIL_LIST_TYPE = 'th'
+FILER_FOLDER_ADMIN_LIST_TYPE_CHOICES = (
+    TABLE_LIST_TYPE,
+    THUMBNAIL_LIST_TYPE,
+)
+FILER_FOLDER_ADMIN_DEFAULT_LIST_TYPE = getattr(settings, 'FILER_FOLDER_ADMIN_DEFAULT_LIST_TYPE', TABLE_LIST_TYPE)
+if FILER_FOLDER_ADMIN_DEFAULT_LIST_TYPE not in FILER_FOLDER_ADMIN_LIST_TYPE_CHOICES:
+    FILER_FOLDER_ADMIN_DEFAULT_LIST_TYPE = TABLE_LIST_TYPE
+
+FILER_FOLDER_ADMIN_LIST_TYPE_SWITCHER_SETTINGS = {
+    TABLE_LIST_TYPE: {
+        'icon': 'th-list',
+        'tooltip_text': _('Show table view'),
+        'template': 'admin/filer/folder/directory_table_list.html',
+    },
+    THUMBNAIL_LIST_TYPE: {
+        'icon': 'th-large',
+        'tooltip_text': _('Show thumbnail view'),
+        'template': 'admin/filer/folder/directory_thumbnail_list.html',
+    },
+}
+
+IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+IMAGE_MIME_TYPES = ['gif', 'jpeg', 'png', 'x-png', 'svg+xml', 'webp']
+
+FILE_VALIDATORS = {
+    "text/html": ["filer.validation.deny_html"],
+    # Other browser-rendered document formats that can execute JavaScript in the
+    # media origin (stored XSS). See https://developer.mozilla.org/en-US/docs/Web/SVG/Attribute/Events
+    "application/xhtml+xml": ["filer.validation.deny"],
+    "application/xml": ["filer.validation.deny"],
+    "text/xml": ["filer.validation.deny"],
+    "application/xslt+xml": ["filer.validation.deny"],
+    "image/svg+xml": ["filer.validation.sanitize_svg"],
+    "application/octet-stream": ["filer.validation.deny"],
+}
+
+remove_mime_types = getattr(settings, "FILER_REMOVE_FILE_VALIDATORS", [])
+for mime_type in remove_mime_types:  # pragma: no cover
+    if mime_type in FILE_VALIDATORS:
+        del FILE_VALIDATORS[mime_type]
+
+for mime_type, validators in getattr(settings, "FILER_ADD_FILE_VALIDATORS", {}).items():  # pragma: no cover
+    if mime_type in FILE_VALIDATORS:
+        FILE_VALIDATORS[mime_type] += list(validators)
+    else:
+        FILE_VALIDATORS[mime_type] = list(validators)
+
+FILER_MIME_TYPE_WHITELIST = getattr(settings, "FILER_MIME_TYPE_WHITELIST", [])
+
+
+# Determine if django CMS is installed and if it comes with its own iconset
+
+ICON_CSS_LIB = ("filer/css/admin_filer.fa.icons.css",)
+if "cms" in settings.INSTALLED_APPS:  # pragma: no cover
+    try:
+        from cms import __version__
+        from cms.utils.urlutils import static_with_version
+
+        if __version__ >= "4":
+            ICON_CSS_LIB = (
+                static_with_version("cms/css/cms.admin.css"),
+                "filer/css/admin_filer.cms.icons.css",
+            )
+    except (ModuleNotFoundError, ImportError):
+        # Import error? No django CMS used: stay with own icons
+        pass
+
+
+# SVG are their own thumbnails if their size is below this limit
+FILER_MAX_SVG_THUMBNAIL_SIZE = getattr(settings, "FILER_MAX_SVG_THUMBNAIL_SIZE", 1024 * 1024)  # 1MB default

@@ -1,14 +1,11 @@
 import mimetypes
 import os
+import uuid
 
-from django.http.multipartparser import (
-    ChunkIter, SkipFile, StopFutureHandlers, StopUpload, exhaust,
-)
+from django.http.multipartparser import ChunkIter, SkipFile, StopFutureHandlers, StopUpload, exhaust
 from django.template.defaultfilters import slugify as slugify_django
 from django.utils.encoding import force_str
 from django.utils.text import get_valid_filename as get_valid_filename_django
-
-from unidecode import unidecode
 
 
 class UploadException(Exception):
@@ -16,19 +13,20 @@ class UploadException(Exception):
 
 
 def handle_upload(request):
-    if not request.method == "POST":
-        raise UploadException("AJAX request not valid: must be POST")
-    if request.is_ajax():
+    if not request.method == 'POST':
+        raise UploadException("XMLHttpRequest not valid: must be POST")
+    if request.headers.get('x-requested-with') == 'XMLHttpRequest':
         # the file is stored raw in the request
         is_raw = True
         filename = request.GET.get('qqfile', False) or request.GET.get('filename', False) or ''
 
         try:
-            content_length = int(request.META['CONTENT_LENGTH'])
-        except (IndexError, TypeError, ValueError):
+            content_length = int(request.headers['content-length'])
+        except (KeyError, TypeError, ValueError):
+            # A missing header raises KeyError, a malformed one ValueError
             content_length = None
 
-        if content_length < 0:
+        if content_length is None or content_length < 0:
             # This means we shouldn't continue...raise an error.
             raise UploadException("Invalid content length: %r" % content_length)
 
@@ -41,7 +39,6 @@ def handle_upload(request):
                                      content_length,
                                      None,
                                      None)
-            pass
 
         # For compatibility with low-level network APIs (with 32-bit integers),
         # the chunk size should be < 2^31, but still divisible by 4.
@@ -85,16 +82,20 @@ def handle_upload(request):
             if retval:
                 break
 
+        upload = None
         for i, handler in enumerate(upload_handlers):
             file_obj = handler.file_complete(counters[i])
             if file_obj:
                 upload = file_obj
                 break
+        if upload is None:
+            # No upload handler took responsibility for the request body
+            raise UploadException("XMLHttpRequest request not valid: Bad Upload")
     else:
         if len(request.FILES) == 1:
             upload, filename, is_raw, mime_type = handle_request_files_upload(request)
         else:
-            raise UploadException("AJAX request not valid: Bad Upload")
+            raise UploadException("XMLHttpRequest request not valid: Bad Upload")
     return upload, filename, is_raw, mime_type
 
 
@@ -112,17 +113,47 @@ def handle_request_files_upload(request):
     is_raw = False
     upload = list(request.FILES.values())[0]
     filename = upload.name
-    _, iext = os.path.splitext(filename)
-    mime_type = upload.content_type.lower()
-    extensions = mimetypes.guess_all_extensions(mime_type)
-    if mime_type != 'application/octet-stream' and extensions and iext.lower() not in extensions:
-        msg = "MIME-Type '{mimetype}' does not correspond to file extension of {filename}."
-        raise UploadException(msg.format(mimetype=mime_type, filename=filename))
+    # The MIME type is derived from the file name and never taken from the
+    # client-supplied Content-Type of the multipart part: the type stored on the
+    # File object (and used by web servers when serving it) is derived from the
+    # file name, too. Trusting the client here would allow an upload to be
+    # validated as one type and then stored and served as another, bypassing
+    # FILER_MIME_TYPE_WHITELIST and the FILE_VALIDATORS (e.g. deny_html or
+    # sanitize_svg). File names with an unknown extension fall back to
+    # "application/octet-stream", which is denied by default.
+    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
     return upload, filename, is_raw, mime_type
 
 
 def slugify(string):
-    return slugify_django(unidecode(force_str(string)))
+    return slugify_django(force_str(string))
+
+
+def _ensure_safe_length(filename, max_length=155, random_suffix_length=16):
+    """
+    Ensures that the filename does not exceed the maximum allowed length.
+    If it does, the function truncates the filename and appends a random hexadecimal
+    suffix of length `random_suffix_length` to ensure uniqueness and compliance with
+    database constraints - even after markers for a thumbnail are added.
+
+    Parameters:
+        filename (str): The filename to check.
+        max_length (int): The maximum allowed length for the filename.
+        random_suffix_length (int): The length of the random suffix to append.
+
+    Returns:
+        str: The safe filename.
+
+
+    Reference issue: https://github.com/django-cms/django-filer/issues/1270
+    """
+
+    if len(filename) <= max_length:
+        return filename
+
+    keep_length = max_length - random_suffix_length
+    random_suffix = uuid.uuid4().hex[:random_suffix_length]
+    return filename[:keep_length] + random_suffix
 
 
 def get_valid_filename(s):
@@ -135,6 +166,9 @@ def get_valid_filename(s):
     filename = slugify(filename)
     ext = slugify(ext)
     if ext:
-        return "%s.%s" % (filename, ext)
+        valid_filename = "{}.{}".format(filename, ext)
     else:
-        return "%s" % (filename,)
+        valid_filename = "{}".format(filename)
+
+    # Ensure the filename meets the maximum length requirements.
+    return _ensure_safe_length(valid_filename)
